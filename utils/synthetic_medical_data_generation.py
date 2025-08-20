@@ -1,9 +1,11 @@
 import numpy as np
+import torch
 from scipy import ndimage
 from typing import Dict, List, Tuple, Optional
 import matplotlib.pyplot as plt
 from pathlib import Path
 import json
+import pickle
 from dataclasses import dataclass
 from sklearn.model_selection import train_test_split
 
@@ -167,26 +169,6 @@ class SyntheticAnatomyGenerator:
         else:
             return self.create_ellipsoid_mask(center, size)
 
-    def add_imaging_artifacts(self, image: np.ndarray) -> np.ndarray:
-        """Add realistic imaging artifacts"""
-        result = image.copy()
-
-        # Gaussian blur (imaging resolution)
-        result = ndimage.gaussian_filter(result, sigma=0.8)
-
-        # Intensity bias field (common in MRI/CT)
-        bias_field = self.create_bias_field()
-        result *= bias_field
-
-        # Random noise
-        noise = np.random.normal(0, 8, image.shape)
-        result += noise
-
-        # Clip to valid intensity range
-        result = np.clip(result, 0, 255)
-
-        return result
-
     def create_bias_field(self) -> np.ndarray:
         """Create smooth intensity bias field"""
         # Create smooth random field at lower resolution
@@ -204,18 +186,50 @@ class SyntheticAnatomyGenerator:
 
         return bias_field
 
+    def generate_individual_structure(self, struct_name: str, template: StructureTemplate,
+                                      center: np.ndarray, size: np.ndarray, intensity: float) -> np.ndarray:
+        """Generate a single structure on blank background with all processing applied"""
+
+        # Create structure on blank background
+        structure_image = np.zeros(self.image_size, dtype=np.float32)
+
+        # Convert relative coordinates to absolute
+        abs_center = (center * np.array(self.image_size)).astype(int)
+        abs_size = (size * np.array(self.image_size) / 2).astype(int)  # Radius, not diameter
+
+        # Create initial structure mask
+        initial_mask = self.create_structure_mask(template, abs_center, abs_size)
+
+        if not initial_mask.any():
+            return structure_image
+
+        # Add structure with internal intensity variation
+        internal_variation = np.random.normal(0, 15, initial_mask.sum())
+        structure_intensities = intensity + internal_variation
+        structure_intensities = np.clip(structure_intensities, intensity * 0.7, intensity * 1.3)
+        structure_image[initial_mask] = structure_intensities
+
+        # Apply imaging artifacts to individual structure
+        # 1. Gaussian blur (imaging resolution)
+        structure_image = ndimage.gaussian_filter(structure_image, sigma=0.8)
+
+        # 2. Intensity bias field (common in MRI/CT)
+        bias_field = self.create_bias_field()
+        structure_image *= bias_field
+
+        # 3. Clip to valid intensity range (but don't add noise yet)
+        structure_image = np.clip(structure_image, 0, 255)
+
+        return structure_image
+
     def generate_sample(self, present_structures: List[str],
                         position_noise: float = 0.05,
                         size_noise: float = 0.2,
                         intensity_noise: float = 0.15) -> Tuple[np.ndarray, Dict[str, np.ndarray], Dict[str, int]]:
         """Generate one synthetic medical image sample"""
 
-        # Initialize background
-        image = np.zeros(self.image_size, dtype=np.float32)
-
-        # Add background tissue noise
-        background_noise = np.random.normal(40, 20, self.image_size)
-        image += np.clip(background_noise, 0, 80)
+        # Initialize final image with zeros (background will be added later)
+        final_image = np.zeros(self.image_size, dtype=np.float32)
 
         # Storage for masks and presence labels
         masks = {}
@@ -226,7 +240,7 @@ class SyntheticAnatomyGenerator:
             presence_labels[struct_name] = 0
             masks[struct_name] = np.zeros(self.image_size, dtype=bool)
 
-        # Generate present structures
+        # Generate each present structure individually
         for struct_name in present_structures:
             if struct_name not in self.anatomy_templates:
                 continue
@@ -249,25 +263,30 @@ class SyntheticAnatomyGenerator:
             intensity *= (1 + np.random.normal(0, intensity_noise))
             intensity = np.clip(intensity, 50, 250)
 
-            # Convert relative coordinates to absolute
-            abs_center = (center * np.array(self.image_size)).astype(int)
-            abs_size = (size * np.array(self.image_size) / 2).astype(int)  # Radius, not diameter
+            # Generate individual structure with all processing
+            structure_image = self.generate_individual_structure(
+                struct_name, template, center, size, intensity
+            )
 
-            # Create structure mask
-            mask = self.create_structure_mask(template, abs_center, abs_size)
-            masks[struct_name] = mask
+            # Generate mask from processed structure (threshold at > 0)
+            masks[struct_name] = structure_image > 0
 
-            # Add structure to image with internal intensity variation
-            if mask.any():
-                internal_variation = np.random.normal(0, 15, mask.sum())
-                structure_intensities = intensity + internal_variation
-                structure_intensities = np.clip(structure_intensities, intensity * 0.7, intensity * 1.3)
-                image[mask] = structure_intensities
+            # Add structure to final image
+            final_image += structure_image
 
-        # Apply imaging artifacts
-        image = self.add_imaging_artifacts(image)
+        # Now add background tissue noise to the final composite image
+        background_noise = np.random.normal(40, 20, self.image_size)
+        background_noise = np.clip(background_noise, 0, 80)
+        final_image += background_noise
 
-        return image, masks, presence_labels
+        # Add final random noise
+        final_noise = np.random.normal(0, 8, self.image_size)
+        final_image += final_noise
+
+        # Final clipping
+        final_image = np.clip(final_image, 0, 255)
+
+        return final_image, masks, presence_labels
 
 
 class SyntheticDatasetGenerator:
