@@ -165,7 +165,7 @@ def validate_synthetic_masks(dataset_path):
             # Mask overlay
             axes[1, struct_idx].imshow(img_slice, cmap='gray', alpha=0.7)
             if present == 1:
-                axes[1, struct_idx].imshow(mask_slice, cmap='red', alpha=0.5, vmin=0, vmax=1)
+                axes[1, struct_idx].imshow(mask_slice, cmap='jet', alpha=0.5, vmin=0, vmax=1)
             axes[1, struct_idx].set_title(f'Mask\nPos pixels: {np.mean(mask_slice > 0.5):.3f}')
             axes[1, struct_idx].axis('off')
 
