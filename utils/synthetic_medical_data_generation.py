@@ -1,11 +1,9 @@
 import numpy as np
-import torch
 from scipy import ndimage
 from typing import Dict, List, Tuple, Optional
 import matplotlib.pyplot as plt
 from pathlib import Path
 import json
-import pickle
 from dataclasses import dataclass
 from sklearn.model_selection import train_test_split
 
@@ -268,8 +266,8 @@ class SyntheticAnatomyGenerator:
                 struct_name, template, center, size, intensity
             )
 
-            # Generate mask from processed structure (threshold at > 0)
-            masks[struct_name] = structure_image > 0
+            # Generate mask from processed structure (threshold at > 10)
+            masks[struct_name] = structure_image > 10
 
             # Add structure to final image
             final_image += structure_image
@@ -531,10 +529,11 @@ def visualize_sample(image: np.ndarray, masks: Dict[str, np.ndarray],
     """Visualize a single sample"""
 
     if slice_idx is None:
-        slice_idx = image.shape[0] // 2
+        slice_idx = image.shape[-1] // 2
 
     # Get middle slice
-    img_slice = image[slice_idx]
+    img_slice = image[..., slice_idx]
+    img_slice = np.rot90(img_slice, -1)
 
     fig, axes = plt.subplots(2, 4, figsize=(16, 8))
     axes = axes.flatten()
@@ -546,11 +545,11 @@ def visualize_sample(image: np.ndarray, masks: Dict[str, np.ndarray],
 
     # Show overlaid structures
     overlay = img_slice.copy()
-    colors = plt.cm.tab10(np.linspace(0, 1, len(masks)))
 
     for i, (struct_name, mask) in enumerate(masks.items()):
         if presence_labels[struct_name] == 1 and mask.any():
-            mask_slice = mask[slice_idx]
+            mask_slice = mask[..., slice_idx]
+            mask_slice = np.rot90(mask_slice, -1)
             overlay[mask_slice] = 255
 
     axes[1].imshow(overlay, cmap='gray')
@@ -563,7 +562,8 @@ def visualize_sample(image: np.ndarray, masks: Dict[str, np.ndarray],
         if plot_idx >= 8:
             break
 
-        mask_slice = mask[slice_idx]
+        mask_slice = mask[..., slice_idx]
+        mask_slice = np.rot90(mask_slice, -1)
         masked_img = img_slice.copy()
         masked_img[~mask_slice] = 0
 
@@ -589,7 +589,7 @@ if __name__ == "__main__":
     # Generate small test dataset
     print("Generating synthetic dataset...")
     dataset = generator.generate_dataset(
-        total_samples=100,  # Small for testing
+        total_samples=1000,  # Small for testing
         validation_split=0.2,
         test_split=0.1,
         position_noise=0.05,
@@ -653,5 +653,5 @@ if __name__ == "__main__":
         visualize_sample(image, masks, presence_labels)
 
     # Save dataset
-    # generator.save_dataset(dataset, './synthetic_medical_dataset')
+    generator.save_dataset(dataset, '../data/synthetic_medical_dataset')
     print("\nDataset generation complete!")
