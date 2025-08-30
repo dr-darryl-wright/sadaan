@@ -224,6 +224,7 @@ class SpatialAttentionMedicalSegmenter(nn.Module):
 
 
 class SpatialAttentionLoss(nn.Module):
+
     def __init__(self, structure_names, weights=None, focal_alpha=0.25, focal_gamma=2.0):
         super().__init__()
         self.structure_names = structure_names
