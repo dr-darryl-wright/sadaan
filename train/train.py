@@ -589,13 +589,21 @@ class Trainer:
                 accumulated_loss = 0
 
             # Store losses (only actual loss values, not scaled)
+            # Store losses (only actual loss values, not scaled)
             for key, value in losses.items():
-                epoch_losses[key].append(value.item())
+                # Handle both tensors and floats
+                if hasattr(value, 'item'):
+                    epoch_losses[key].append(value.item())
+                else:
+                    epoch_losses[key].append(float(value))
 
+            # Enhanced Sacred logging with all loss components
             # Enhanced Sacred logging with all loss components
             if self.global_step % logging.get('log_frequency', 1) == 0:
                 for key, value in losses.items():
-                    ex.log_scalar(f'train.batch.{key}', value.item(), self.global_step)
+                    # Handle both tensors and floats for Sacred logging
+                    loss_value = value.item() if hasattr(value, 'item') else float(value)
+                    ex.log_scalar(f'train.batch.{key}', loss_value, self.global_step)
 
                 # Log learning rate and memory usage
                 current_lr = self.optimizer.param_groups[0]['lr']
