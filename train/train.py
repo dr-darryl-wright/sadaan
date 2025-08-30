@@ -46,39 +46,48 @@ def config():
     # Model parameters
     model = {
         'in_channels': 1,
-        'feature_channels': 128,
+        'feature_channels': 64,
         'presence_threshold': 0.5
     }
     # Training parameters
     training = {
-        'batch_size': 2,
-        'learning_rate': 1e-3,
+        'batch_size': 4,
+        'learning_rate': 5e-4,
         'num_epochs': 100,
-        'early_stopping_patience': 15,
-        'gradient_clip_norm': 1.0,
+        'early_stopping_patience': 20,
+        'gradient_clip_norm': 0.5,
         'num_workers': 2,
+        'warmup_epochs': 5,
+        'validate_every_n_epochs': 2,
         # Memory optimization parameters
-        'gradient_accumulation_steps': 1,  # For simulating larger batches
+        'gradient_accumulation_steps': 2,  # For simulating larger batches
         'memory_cleanup_frequency': 10,  # Clean memory every N batches
         'max_batches_in_memory': 50  # Limit cached data
     }
     # Loss parameters
     loss_weights = {
         'segmentation': 1.0,
+        'dice': 2.0,
+        'focal_seg': 1.0,
         'absence': 1.0,
         'attention_supervision': 0.5,
         'confidence': 0.1
     }
     # Augmentation parameters
     augmentation = {
-        'noise_std': 5.0,
-        'intensity_scale_range': [0.9, 1.1],
-        'enabled': True
+        'noise_std': 2.0,
+        'intensity_scale_range': [0.95, 1.05],
+        'enabled': True,
+        'rotation_degrees': 5,
+        'flip_probability': 0.3
     }
     # Optimizer parameters
     optimizer = {
-        'type': 'adam',
-        'lr_scheduler': 'reduce_on_plateau',
+        'type': 'adamw',
+        'weight_decay': 1e-4,
+        'lr_scheduler': 'cosine_annealing',
+        'lr_min': 1e-6,
+        'lr_restart_period': 20,
         'lr_factor': 0.5,
         'lr_patience': 10
     }
@@ -324,6 +333,25 @@ class MetricsCalculator:
         }
 
 
+class LearningRateWarmup:
+    """Learning rate warmup scheduler"""
+
+    def __init__(self, optimizer, warmup_epochs, base_lr):
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.base_lr = base_lr
+        self.current_epoch = 0
+
+    def step(self):
+        if self.current_epoch < self.warmup_epochs:
+            # Linear warmup
+            lr = self.base_lr * (self.current_epoch + 1) / self.warmup_epochs
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = lr
+
+        self.current_epoch += 1
+
+
 @ex.capture
 def create_model(model, structure_names, image_size, device):
     """Create and initialize model"""
@@ -424,7 +452,12 @@ class Trainer:
         self.training_config = training
 
         # Loss function and optimizer
-        self.loss_fn = SpatialAttentionLoss(structure_names, weights=loss_weights)
+        self.loss_fn = SpatialAttentionLoss(
+            structure_names,
+            weights=loss_weights,
+            focal_alpha=0.25,
+            focal_gamma=2.0
+        )
 
         if optimizer['type'] == 'adam':
             self.optimizer = optim.Adam(model.parameters(), lr=training['learning_rate'])
@@ -467,9 +500,18 @@ class Trainer:
         if torch.cuda.is_available():
             print(f"Initial GPU memory: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
 
+        # Setup warmup if specified
+        warmup_epochs = training.get('warmup_epochs', 0)
+        if warmup_epochs > 0:
+            self.setup_warmup_scheduler(warmup_epochs)
+
+        # Track current epoch for warmup
+        self.current_epoch = 0
+
     @ex.capture
     def train_epoch(self, logging) -> Dict:
         """Train for one epoch with memory optimization"""
+        """Train for one epoch with improved loss handling and diagnostics"""
         self.model.train()
         epoch_losses = defaultdict(list)
 
@@ -485,6 +527,14 @@ class Trainer:
 
         pbar = tqdm(self.train_loader, desc="Training")
         accumulated_loss = 0
+
+        # Initialize warmup scheduler if in warmup phase
+        warmup_epochs = getattr(self, 'warmup_epochs', 0)
+        if hasattr(self, 'warmup_scheduler') and hasattr(self, 'current_epoch'):
+            if self.current_epoch < warmup_epochs:
+                self.warmup_scheduler.step()
+                print(
+                    f"Warmup epoch {self.current_epoch + 1}/{warmup_epochs}, LR: {self.optimizer.param_groups[0]['lr']:.6f}")
 
         for batch_idx, batch in enumerate(pbar):
             self.global_step += 1
@@ -509,7 +559,7 @@ class Trainer:
                 'presence_targets': true_presence
             }
 
-            # Calculate loss
+            # Calculate improved loss with all components
             losses = self.loss_fn(outputs, targets)
             total_loss = losses['total']
 
@@ -524,20 +574,25 @@ class Trainer:
             # Update weights if gradient accumulation step is complete
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
                 # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     max_norm=self.training_config['gradient_clip_norm']
                 )
 
                 self.optimizer.step()
+
+                # Log gradient norm for monitoring
+                if hasattr(self, 'global_step') and self.global_step % (logging.get('log_frequency', 1) * 10) == 0:
+                    ex.log_scalar('train.gradient_norm', grad_norm.item(), self.global_step)
+
                 accumulated_loss = 0
 
             # Store losses (only actual loss values, not scaled)
             for key, value in losses.items():
                 epoch_losses[key].append(value.item())
 
-            # Sacred logging (frequent)
-            if self.global_step % logging['log_frequency'] == 0:
+            # Enhanced Sacred logging with all loss components
+            if self.global_step % logging.get('log_frequency', 1) == 0:
                 for key, value in losses.items():
                     ex.log_scalar(f'train.batch.{key}', value.item(), self.global_step)
 
@@ -548,6 +603,39 @@ class Trainer:
                 if torch.cuda.is_available():
                     memory_gb = torch.cuda.memory_allocated() / 1024 ** 3
                     ex.log_scalar('system.gpu_memory_gb', memory_gb, self.global_step)
+
+            # Enhanced debug prints for first few batches with all loss components
+            if batch_idx < 3:
+                print(f"Batch {batch_idx} Debug:")
+                print(f"  Total Loss: {total_loss.item():.4f}")
+                print(f"  Segmentation Loss: {losses.get('segmentation', 0):.4f}")
+                print(f"  Dice Loss: {losses.get('dice', 0):.4f}")
+                print(f"  Focal Loss: {losses.get('focal_seg', 0):.4f}")
+                print(f"  Presence Loss: {losses.get('absence', 0):.4f}")
+                print(f"  Attention Loss: {losses.get('attention_supervision', 0):.4f}")
+                print(f"  Confidence Loss: {losses.get('confidence', 0):.4f}")
+
+                # Quick segmentation check for first batch
+                if batch_idx == 0:
+                    with torch.no_grad():
+                        seg_probs = outputs['segmentation_probs']
+                        seg_mean = seg_probs.mean().item()
+                        seg_max = seg_probs.max().item()
+                        seg_min = seg_probs.min().item()
+
+                        # Check for saturation issues
+                        near_zero = (seg_probs < 0.01).float().mean().item()
+                        near_one = (seg_probs > 0.99).float().mean().item()
+
+                        print(f"  Seg Probs: mean={seg_mean:.4f}, min={seg_min:.4f}, max={seg_max:.4f}")
+                        print(f"  Saturation: {near_zero * 100:.1f}% near 0, {near_one * 100:.1f}% near 1")
+
+                        # Quick presence check
+                        presence_probs = outputs['presence_probs']
+                        true_presence_count = true_presence.sum().item()
+                        pred_presence_count = (presence_probs > 0.5).sum().item()
+
+                        print(f"  Presence: True={true_presence_count}, Pred={pred_presence_count}")
 
             # Collect predictions for metrics (with memory management)
             with torch.no_grad():
@@ -566,10 +654,13 @@ class Trainer:
             if (batch_idx + 1) % self.memory_cleanup_frequency == 0:
                 cleanup_memory()
 
-            # Update progress bar
-            avg_loss = np.mean(epoch_losses['total']) if epoch_losses['total'] else 0
+            # Enhanced progress bar with more loss components
+            avg_total_loss = np.mean(epoch_losses['total']) if epoch_losses['total'] else 0
+            avg_dice_loss = np.mean(epoch_losses.get('dice', [0])) if epoch_losses.get('dice') else 0
+
             pbar.set_postfix({
-                'loss': f"{avg_loss:.4f}",
+                'total': f"{avg_total_loss:.4f}",
+                'dice': f"{avg_dice_loss:.4f}",
                 'mem_gb': f"{torch.cuda.memory_allocated() / 1024 ** 3:.1f}" if torch.cuda.is_available() else "N/A"
             })
 
@@ -594,6 +685,12 @@ class Trainer:
                 all_pred_masks, all_true_masks, all_true_presence_for_seg
             )
 
+            # Enhanced per-structure Dice reporting for debugging
+            if hasattr(seg_metrics, 'structure_dice') and seg_metrics['structure_dice']:
+                print("\nPer-structure Dice scores:")
+                for struct_name, dice_info in seg_metrics['structure_dice'].items():
+                    print(f"  {struct_name}: {dice_info['mean']:.4f} ± {dice_info['std']:.4f} (n={dice_info['count']})")
+
             # Clean up tensors
             del all_pred_presence, all_true_presence, all_pred_masks, all_true_masks, all_true_presence_for_seg
         else:
@@ -608,14 +705,34 @@ class Trainer:
         # Final memory cleanup
         cleanup_memory()
 
-        # Combine results
+        # Enhanced results with all loss components
         train_results = {
             'losses': {k: np.mean(v) for k, v in epoch_losses.items()},
             'presence_metrics': presence_metrics,
             'segmentation_metrics': seg_metrics
         }
 
+        # Print epoch summary with enhanced loss breakdown
+        print(f"\nEpoch Training Summary:")
+        print(f"  Total Loss: {train_results['losses']['total']:.4f}")
+        print(f"  Segmentation Loss: {train_results['losses'].get('segmentation', 0):.4f}")
+        print(f"  Dice Loss: {train_results['losses'].get('dice', 0):.4f}")
+        print(f"  Focal Loss: {train_results['losses'].get('focal_seg', 0):.4f}")
+        print(f"  Presence Accuracy: {presence_metrics['overall_accuracy']:.4f}")
+        print(f"  Mean Dice: {seg_metrics['mean_dice']:.4f}")
+
         return train_results
+
+    # Additional helper method to add to the Trainer class for warmup support
+    def setup_warmup_scheduler(self, warmup_epochs=5):
+        """Setup learning rate warmup scheduler"""
+        self.warmup_epochs = warmup_epochs
+        self.warmup_scheduler = LearningRateWarmup(
+            self.optimizer,
+            warmup_epochs,
+            self.training_config['learning_rate']
+        )
+        print(f"Warmup scheduler initialized for {warmup_epochs} epochs")
 
     def validate_epoch(self) -> Dict:
         """Validate for one epoch with memory optimization"""
@@ -721,6 +838,8 @@ class Trainer:
         print(f"Val samples: {len(self.val_loader.dataset)}")
 
         for epoch in range(num_epochs):
+            self.current_epoch = epoch
+
             print(f"\nEpoch {epoch + 1}/{num_epochs}")
             print("-" * 50)
 

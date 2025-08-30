@@ -224,84 +224,135 @@ class SpatialAttentionMedicalSegmenter(nn.Module):
 
 
 class SpatialAttentionLoss(nn.Module):
-    """
-    Combined loss function for training the spatial attention model.
-    """
 
-    def __init__(self, structure_names: List[str], weights: Optional[Dict[str, float]] = None):
-        super().__init__()
-        self.structure_names = structure_names
-        self.num_structures = len(structure_names)
+    def focal_loss(self, logits, targets, alpha=0.25, gamma=2.0):
+        """Focal loss to handle class imbalance"""
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        pt = torch.exp(-bce_loss)
+        focal_loss = alpha * (1 - pt) ** gamma * bce_loss
+        return focal_loss.mean()
 
-        # Loss weights
-        default_weights = {
-            'segmentation': 1.0,
-            'absence': 1.0,
-            'attention_supervision': 0.5,
-            'confidence': 0.1
-        }
-        self.weights = weights if weights is not None else default_weights
+    def dice_loss(self, probs, targets, epsilon=1e-6):
+        """Differentiable Dice loss"""
+        probs_flat = probs.view(-1)
+        targets_flat = targets.view(-1)
 
-        # Loss functions
-        self.seg_loss = nn.BCEWithLogitsLoss()
-        self.absence_loss = nn.CrossEntropyLoss()
-        self.mse_loss = nn.MSELoss()
+        intersection = (probs_flat * targets_flat).sum()
+        dice_score = (2.0 * intersection + epsilon) / (probs_flat.sum() + targets_flat.sum() + epsilon)
 
-    def forward(self, outputs: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        return 1.0 - dice_score
+
+    def forward(self, outputs, targets):
+        """Improved forward pass"""
+        seg_logits = outputs['segmentation_logits']
+        seg_probs = outputs['segmentation_probs']
+        presence_probs = outputs['presence_probs']
+
+        seg_targets = targets['segmentation_targets']
+        presence_targets = targets['presence_targets'].float()
+
+        batch_size = seg_logits.shape[0]
+        device = seg_logits.device
+
         losses = {}
 
-        # Segmentation loss (only for present structures)
-        if 'segmentation_targets' in targets and 'presence_targets' in targets:
-            seg_logits = outputs['segmentation_logits']
-            seg_targets = targets['segmentation_targets']
-            presence_targets = targets['presence_targets']  # [B, num_structures]
+        # 1. IMPROVED SEGMENTATION LOSS
+        seg_loss_total = 0
+        dice_loss_total = 0
+        focal_loss_total = 0
+        present_count = 0
 
-            # Mask loss to only include present structures
-            seg_loss = 0
-            for i in range(self.num_structures):
-                present_mask = presence_targets[:, i].bool()
-                if present_mask.any():
-                    struct_logits = seg_logits[present_mask, i]
-                    struct_targets = seg_targets[present_mask, i]
-                    seg_loss += self.seg_loss(struct_logits, struct_targets.float())
+        for b in range(batch_size):
+            for s in range(self.num_structures):
+                if presence_targets[b, s] == 1:  # Only for present structures
+                    # Standard BCE loss
+                    seg_bce = self.bce_with_logits(
+                        seg_logits[b, s],
+                        seg_targets[b, s]
+                    ).mean()
 
-            losses['segmentation'] = seg_loss / max(1, self.num_structures)
+                    # Dice loss
+                    dice_loss = self.dice_loss(seg_probs[b, s], seg_targets[b, s])
 
-        # Absence detection loss
-        if 'presence_targets' in targets:
-            absence_logits = outputs['absence_logits']  # [B, num_structures, 2]
-            presence_targets = targets['presence_targets'].long()  # [B, num_structures]
+                    # Focal loss for hard examples
+                    focal_loss = self.focal_loss(
+                        seg_logits[b, s],
+                        seg_targets[b, s],
+                        self.focal_alpha,
+                        self.focal_gamma
+                    )
 
-            absence_loss = 0
-            for i in range(self.num_structures):
-                absence_loss += self.absence_loss(absence_logits[:, i], presence_targets[:, i])
-            losses['absence'] = absence_loss / self.num_structures
+                    seg_loss_total += seg_bce
+                    dice_loss_total += dice_loss
+                    focal_loss_total += focal_loss
+                    present_count += 1
 
-        # Attention supervision loss (if attention targets provided)
-        if 'attention_targets' in targets:
+        if present_count > 0:
+            losses['segmentation'] = seg_loss_total / present_count
+            losses['dice'] = dice_loss_total / present_count
+            losses['focal_seg'] = focal_loss_total / present_count
+        else:
+            losses['segmentation'] = torch.tensor(0.0, device=device)
+            losses['dice'] = torch.tensor(0.0, device=device)
+            losses['focal_seg'] = torch.tensor(0.0, device=device)
+
+        # 2. PRESENCE DETECTION LOSS
+        presence_loss = self.bce(presence_probs, presence_targets).mean()
+        losses['absence'] = presence_loss
+
+        # 3. ATTENTION SUPERVISION (if available)
+        if 'attention_maps' in outputs:
+            # Attention should focus on regions where structures are present
             attention_maps = outputs['attention_maps']
-            attention_targets = targets['attention_targets']
-            losses['attention_supervision'] = self.mse_loss(attention_maps, attention_targets)
+            attention_loss = 0
 
-        # Confidence calibration loss
-        if 'presence_targets' in targets:
-            confidence_scores = outputs['confidence_scores']
-            presence_probs = outputs['presence_probs']
-            presence_targets_float = targets['presence_targets'].float()
+            for b in range(batch_size):
+                for s in range(self.num_structures):
+                    if presence_targets[b, s] == 1:
+                        # Attention should be high where mask is positive
+                        target_attention = (seg_targets[b, s] > 0.5).float()
+                        attention_bce = self.bce(
+                            attention_maps[b, s],
+                            target_attention
+                        ).mean()
+                        attention_loss += attention_bce
 
-            # Encourage high confidence when predictions are correct
-            correct_predictions = (presence_probs > 0.5) == presence_targets_float
-            confidence_targets = correct_predictions.float()
-            losses['confidence'] = self.mse_loss(confidence_scores, confidence_targets)
+            losses['attention_supervision'] = attention_loss / (batch_size * self.num_structures)
+        else:
+            losses['attention_supervision'] = torch.tensor(0.0, device=device)
 
-        # Combine losses
-        total_loss = sum(self.weights.get(k, 1.0) * v for k, v in losses.items())
+        # 4. CONFIDENCE REGULARIZATION
+        # Penalize overconfident wrong predictions
+        confidence_loss = 0
+        for b in range(batch_size):
+            for s in range(self.num_structures):
+                pred_conf = presence_probs[b, s]
+                true_pres = presence_targets[b, s]
+
+                if true_pres == 0 and pred_conf > 0.5:
+                    # Overconfident false positive
+                    confidence_loss += (pred_conf - 0.5) ** 2
+                elif true_pres == 1 and pred_conf < 0.5:
+                    # Underconfident false negative
+                    confidence_loss += (0.5 - pred_conf) ** 2
+
+        losses['confidence'] = confidence_loss / (batch_size * self.num_structures)
+
+        # TOTAL LOSS
+        total_loss = (
+                self.weights['segmentation'] * losses['segmentation'] +
+                self.weights['dice'] * losses['dice'] +
+                self.weights.get('focal_seg', 0.5) * losses['focal_seg'] +
+                self.weights['absence'] * losses['absence'] +
+                self.weights['attention_supervision'] * losses['attention_supervision'] +
+                self.weights['confidence'] * losses['confidence']
+        )
+
         losses['total'] = total_loss
 
         return losses
 
 
-# Example usage and training setup
 def create_sample_data(batch_size: int = 2, num_structures: int = 5):
     """Create sample data for demonstration"""
     spatial_dims = (64, 64, 64)
@@ -317,6 +368,30 @@ def create_sample_data(batch_size: int = 2, num_structures: int = 5):
     }
 
     return x, targets
+
+
+# Example usage and training setup
+def __init__(self, structure_names, weights=None, focal_alpha=0.25, focal_gamma=2.0):
+    super().__init__()
+    self.structure_names = structure_names
+    self.num_structures = len(structure_names)
+
+    # Default weights
+    default_weights = {
+        'segmentation': 1.0,
+        'absence': 1.0,
+        'attention_supervision': 0.5,
+        'confidence': 0.1,
+        'focal_seg': 0.5  # New focal loss weight
+    }
+
+    self.weights = weights if weights else default_weights
+    self.focal_alpha = focal_alpha
+    self.focal_gamma = focal_gamma
+
+    # BCE with logits for numerical stability
+    self.bce_with_logits = torch.nn.BCEWithLogitsLoss(reduction='none')
+    self.bce = torch.nn.BCELoss(reduction='none')
 
 
 if __name__ == "__main__":
