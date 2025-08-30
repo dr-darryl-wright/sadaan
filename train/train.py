@@ -451,7 +451,7 @@ class Trainer:
         self.device = device
         self.training_config = training
 
-        # Loss function and optimizer
+        # Use improved loss function instead of original
         self.loss_fn = SpatialAttentionLoss(
             structure_names,
             weights=loss_weights,
@@ -459,13 +459,8 @@ class Trainer:
             focal_gamma=2.0
         )
 
-        if optimizer['type'] == 'adam':
-            self.optimizer = optim.Adam(model.parameters(), lr=training['learning_rate'])
-        elif optimizer['type'] == 'sgd':
-            self.optimizer = optim.SGD(model.parameters(), lr=training['learning_rate'],
-                                       momentum=0.9, weight_decay=1e-4)
-        else:
-            raise ValueError(f"Unknown optimizer type: {optimizer['type']}")
+        # Fixed optimizer creation
+        self.optimizer = self.create_optimizer(model, training, optimizer)
 
         # Learning rate scheduler
         if optimizer['lr_scheduler'] == 'reduce_on_plateau':
@@ -473,6 +468,12 @@ class Trainer:
                 self.optimizer, mode='min',
                 factor=optimizer['lr_factor'],
                 patience=optimizer['lr_patience']
+            )
+        elif optimizer['lr_scheduler'] == 'cosine_annealing':
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=optimizer.get('lr_restart_period', 20),
+                eta_min=optimizer.get('lr_min', 1e-6)
             )
         else:
             self.scheduler = None
@@ -496,10 +497,6 @@ class Trainer:
         # Sacred logging
         self.global_step = 0
 
-        # Initialize memory tracking
-        if torch.cuda.is_available():
-            print(f"Initial GPU memory: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
-
         # Setup warmup if specified
         warmup_epochs = training.get('warmup_epochs', 0)
         if warmup_epochs > 0:
@@ -507,6 +504,10 @@ class Trainer:
 
         # Track current epoch for warmup
         self.current_epoch = 0
+
+        # Initialize memory tracking
+        if torch.cuda.is_available():
+            print(f"Initial GPU memory: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
 
     @ex.capture
     def train_epoch(self, logging) -> Dict:
@@ -733,6 +734,32 @@ class Trainer:
             self.training_config['learning_rate']
         )
         print(f"Warmup scheduler initialized for {warmup_epochs} epochs")
+
+    def create_optimizer(self, model, training, optimizer_config):
+        """Create optimizer with support for AdamW"""
+
+        if optimizer_config['type'] == 'adam':
+            optimizer = optim.Adam(
+                model.parameters(),
+                lr=training['learning_rate']
+            )
+        elif optimizer_config['type'] == 'adamw':
+            optimizer = optim.AdamW(
+                model.parameters(),
+                lr=training['learning_rate'],
+                weight_decay=optimizer_config.get('weight_decay', 1e-4)
+            )
+        elif optimizer_config['type'] == 'sgd':
+            optimizer = optim.SGD(
+                model.parameters(),
+                lr=training['learning_rate'],
+                momentum=0.9,
+                weight_decay=optimizer_config.get('weight_decay', 1e-4)
+            )
+        else:
+            raise ValueError(f"Unknown optimizer type: {optimizer_config['type']}")
+
+        return optimizer
 
     def validate_epoch(self) -> Dict:
         """Validate for one epoch with memory optimization"""
