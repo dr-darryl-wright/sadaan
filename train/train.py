@@ -810,9 +810,13 @@ class Trainer:
                 }
                 losses = self.loss_fn(outputs, targets)
 
-                # Store losses
+                # Store losses (only actual loss values, not scaled)
                 for key, value in losses.items():
-                    epoch_losses[key].append(value.item())
+                    # Handle both tensors and floats
+                    if hasattr(value, 'item'):
+                        epoch_losses[key].append(value.item())
+                    else:
+                        epoch_losses[key].append(float(value))
 
                 # FIX: Calculate metrics incrementally during validation loop
                 # Presence accuracy
