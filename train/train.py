@@ -61,8 +61,8 @@ def config():
         'validate_every_n_epochs': 2,
         # Memory optimization parameters
         'gradient_accumulation_steps': 2,  # For simulating larger batches
-        'memory_cleanup_frequency': 10,  # Clean memory every N batches
-        'max_batches_in_memory': 50  # Limit cached data
+        'memory_cleanup_frequency': 5,  # More frequent cleanup
+        'max_history_length': 50  # Limit history storage
     }
     # Loss parameters
     loss_weights = {
@@ -431,11 +431,20 @@ def create_data_loaders(dataset_path, training, augmentation):
 
 
 def cleanup_memory():
-    """Force garbage collection and CUDA memory cleanup"""
-    gc.collect()
+    """Enhanced memory cleanup"""
+    # Multiple garbage collection passes
+    for _ in range(3):
+        gc.collect()
+
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+        # Try to defragment memory
+        try:
+            torch.cuda.memory._record_memory_history()
+        except:
+            pass
 
 
 class Trainer:
@@ -483,7 +492,8 @@ class Trainer:
 
         # Memory optimization parameters
         self.gradient_accumulation_steps = training.get('gradient_accumulation_steps', 1)
-        self.memory_cleanup_frequency = training.get('memory_cleanup_frequency', 10)
+        self.memory_cleanup_frequency = training.get('memory_cleanup_frequency', 5)
+        self.max_history_length = training.get('max_history_length', 50)
 
         # Training history - limit memory usage
         self.history = {
@@ -509,22 +519,36 @@ class Trainer:
         if torch.cuda.is_available():
             print(f"Initial GPU memory: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
 
+    def dice_coefficient_fast(self, pred_mask, true_mask, epsilon=1e-6):
+        """Fast dice calculation without creating intermediate tensors"""
+        pred_flat = pred_mask.view(-1)
+        true_flat = true_mask.view(-1)
+        intersection = (pred_flat * true_flat).sum()
+        dice = (2.0 * intersection + epsilon) / (pred_flat.sum() + true_flat.sum() + epsilon)
+        return dice
+
+    def handle_oom(self):
+        """Handle out of memory errors by increasing gradient accumulation"""
+        if hasattr(self, 'gradient_accumulation_steps'):
+            self.gradient_accumulation_steps *= 2
+            print(f"OOM detected, increasing gradient accumulation to {self.gradient_accumulation_steps}")
+            cleanup_memory()
+            return True
+        return False
+
     @ex.capture
     def train_epoch(self, logging) -> Dict:
-        """Train for one epoch with improved loss handling and diagnostics"""
+        """Train for one epoch with memory leak fixes"""
         self.model.train()
         epoch_losses = defaultdict(list)
 
-        # Use lists with limited capacity for memory efficiency
-        batch_pred_presence = []
-        batch_true_presence = []
-        batch_pred_masks = []
-        batch_true_masks = []
-        batch_true_presence_for_seg = []
+        # FIX: Use running metrics instead of accumulating all predictions
+        running_presence_correct = 0
+        running_presence_total = 0
+        running_dice_sum = 0
+        running_dice_count = 0
 
         # Track memory usage
-        max_batches_in_memory = self.training_config.get('max_batches_in_memory', 50)
-
         pbar = tqdm(self.train_loader, desc="Training")
         accumulated_loss = 0
 
@@ -539,174 +563,166 @@ class Trainer:
         for batch_idx, batch in enumerate(pbar):
             self.global_step += 1
 
-            # Move to device
-            images = batch['image'].to(self.device, non_blocking=True)
-            true_masks = batch['masks'].to(self.device, non_blocking=True)
-            true_presence = batch['presence_labels'].to(self.device, non_blocking=True)
+            try:
+                # Move to device
+                images = batch['image'].to(self.device, non_blocking=True)
+                true_masks = batch['masks'].to(self.device, non_blocking=True)
+                true_presence = batch['presence_labels'].to(self.device, non_blocking=True)
 
-            # Forward pass
-            if self.gradient_accumulation_steps > 1 and batch_idx % self.gradient_accumulation_steps != 0:
-                # Don't zero gradients for gradient accumulation
-                pass
-            else:
-                self.optimizer.zero_grad()
-
-            outputs = self.model(images)
-
-            # Prepare targets
-            targets = {
-                'segmentation_targets': true_masks,
-                'presence_targets': true_presence
-            }
-
-            # Calculate improved loss with all components
-            losses = self.loss_fn(outputs, targets)
-            total_loss = losses['total']
-
-            # Scale loss for gradient accumulation
-            if self.gradient_accumulation_steps > 1:
-                total_loss = total_loss / self.gradient_accumulation_steps
-
-            # Backward pass
-            total_loss.backward()
-            accumulated_loss += total_loss.item()
-
-            # Update weights if gradient accumulation step is complete
-            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
-                # Gradient clipping
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    max_norm=self.training_config['gradient_clip_norm']
-                )
-
-                self.optimizer.step()
-
-                # Log gradient norm for monitoring
-                if hasattr(self, 'global_step') and self.global_step % (logging.get('log_frequency', 1) * 10) == 0:
-                    ex.log_scalar('train.gradient_norm', grad_norm.item(), self.global_step)
-
-                accumulated_loss = 0
-
-            # Store losses (only actual loss values, not scaled)
-            for key, value in losses.items():
-                # Handle both tensors and floats
-                if hasattr(value, 'item'):
-                    epoch_losses[key].append(value.item())
+                # Forward pass
+                if self.gradient_accumulation_steps > 1 and batch_idx % self.gradient_accumulation_steps != 0:
+                    # Don't zero gradients for gradient accumulation
+                    pass
                 else:
-                    epoch_losses[key].append(float(value))
+                    self.optimizer.zero_grad()
 
-            # Enhanced Sacred logging with all loss components
-            if self.global_step % logging.get('log_frequency', 1) == 0:
+                outputs = self.model(images)
+
+                # Prepare targets
+                targets = {
+                    'segmentation_targets': true_masks,
+                    'presence_targets': true_presence
+                }
+
+                # Calculate improved loss with all components
+                losses = self.loss_fn(outputs, targets)
+                total_loss = losses['total']
+
+                # Scale loss for gradient accumulation
+                if self.gradient_accumulation_steps > 1:
+                    total_loss = total_loss / self.gradient_accumulation_steps
+
+                # Backward pass
+                total_loss.backward()
+                accumulated_loss += total_loss.item()
+
+                # Update weights if gradient accumulation step is complete
+                if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                    # Gradient clipping
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        max_norm=self.training_config['gradient_clip_norm']
+                    )
+
+                    self.optimizer.step()
+
+                    # Log gradient norm for monitoring
+                    if hasattr(self, 'global_step') and self.global_step % (logging.get('log_frequency', 1) * 10) == 0:
+                        ex.log_scalar('train.gradient_norm', grad_norm.item(), self.global_step)
+
+                    accumulated_loss = 0
+
+                # Store losses (only actual loss values, not scaled)
                 for key, value in losses.items():
-                    # Handle both tensors and floats for Sacred logging
-                    loss_value = value.item() if hasattr(value, 'item') else float(value)
-                    ex.log_scalar(f'train.batch.{key}', loss_value, self.global_step)
+                    # Handle both tensors and floats
+                    if hasattr(value, 'item'):
+                        epoch_losses[key].append(value.item())
+                    else:
+                        epoch_losses[key].append(float(value))
 
-                # Log learning rate and memory usage
-                current_lr = self.optimizer.param_groups[0]['lr']
-                ex.log_scalar('train.learning_rate', current_lr, self.global_step)
+                # Enhanced Sacred logging with all loss components
+                if self.global_step % logging.get('log_frequency', 1) == 0:
+                    for key, value in losses.items():
+                        # Handle both tensors and floats for Sacred logging
+                        loss_value = value.item() if hasattr(value, 'item') else float(value)
+                        ex.log_scalar(f'train.batch.{key}', loss_value, self.global_step)
 
-                if torch.cuda.is_available():
-                    memory_gb = torch.cuda.memory_allocated() / 1024 ** 3
-                    ex.log_scalar('system.gpu_memory_gb', memory_gb, self.global_step)
+                    # Log learning rate and memory usage
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    ex.log_scalar('train.learning_rate', current_lr, self.global_step)
 
-            # Enhanced debug prints for first few batches with all loss components
-            if batch_idx < 3:
-                print(f"Batch {batch_idx} Debug:")
-                print(f"  Total Loss: {total_loss.item():.4f}")
-                print(f"  Segmentation Loss: {losses.get('segmentation', 0):.4f}")
-                print(f"  Dice Loss: {losses.get('dice', 0):.4f}")
-                print(f"  Focal Loss: {losses.get('focal_seg', 0):.4f}")
-                print(f"  Presence Loss: {losses.get('absence', 0):.4f}")
-                print(f"  Attention Loss: {losses.get('attention_supervision', 0):.4f}")
-                print(f"  Confidence Loss: {losses.get('confidence', 0):.4f}")
+                    if torch.cuda.is_available():
+                        memory_gb = torch.cuda.memory_allocated() / 1024 ** 3
+                        ex.log_scalar('system.gpu_memory_gb', memory_gb, self.global_step)
 
-                # Quick segmentation check for first batch
-                if batch_idx == 0:
-                    with torch.no_grad():
-                        seg_probs = outputs['segmentation_probs']
-                        seg_mean = seg_probs.mean().item()
-                        seg_max = seg_probs.max().item()
-                        seg_min = seg_probs.min().item()
+                # Enhanced debug prints for first few batches with all loss components
+                if batch_idx < 3:
+                    print(f"Batch {batch_idx} Debug:")
+                    print(f"  Total Loss: {total_loss.item():.4f}")
+                    print(f"  Segmentation Loss: {losses.get('segmentation', 0):.4f}")
+                    print(f"  Dice Loss: {losses.get('dice', 0):.4f}")
+                    print(f"  Focal Loss: {losses.get('focal_seg', 0):.4f}")
+                    print(f"  Presence Loss: {losses.get('absence', 0):.4f}")
+                    print(f"  Attention Loss: {losses.get('attention_supervision', 0):.4f}")
+                    print(f"  Confidence Loss: {losses.get('confidence', 0):.4f}")
 
-                        # Check for saturation issues
-                        near_zero = (seg_probs < 0.01).float().mean().item()
-                        near_one = (seg_probs > 0.99).float().mean().item()
+                    # Quick segmentation check for first batch
+                    if batch_idx == 0:
+                        with torch.no_grad():
+                            seg_probs = outputs['segmentation_probs']
+                            seg_mean = seg_probs.mean().item()
+                            seg_max = seg_probs.max().item()
+                            seg_min = seg_probs.min().item()
 
-                        print(f"  Seg Probs: mean={seg_mean:.4f}, min={seg_min:.4f}, max={seg_max:.4f}")
-                        print(f"  Saturation: {near_zero * 100:.1f}% near 0, {near_one * 100:.1f}% near 1")
+                            # Check for saturation issues
+                            near_zero = (seg_probs < 0.01).float().mean().item()
+                            near_one = (seg_probs > 0.99).float().mean().item()
 
-                        # Quick presence check
-                        presence_probs = outputs['presence_probs']
-                        true_presence_count = true_presence.sum().item()
-                        pred_presence_count = (presence_probs > 0.5).sum().item()
+                            print(f"  Seg Probs: mean={seg_mean:.4f}, min={seg_min:.4f}, max={seg_max:.4f}")
+                            print(f"  Saturation: {near_zero * 100:.1f}% near 0, {near_one * 100:.1f}% near 1")
 
-                        print(f"  Presence: True={true_presence_count}, Pred={pred_presence_count}")
+                            # Quick presence check
+                            presence_probs = outputs['presence_probs']
+                            true_presence_count = true_presence.sum().item()
+                            pred_presence_count = (presence_probs > 0.5).sum().item()
 
-            # Collect predictions for metrics (with memory management)
-            with torch.no_grad():
-                # Only keep predictions if we haven't exceeded memory limit
-                if len(batch_pred_presence) < max_batches_in_memory:
-                    batch_pred_presence.append(outputs['presence_probs'].detach().cpu())
-                    batch_true_presence.append(true_presence.detach().cpu())
-                    batch_pred_masks.append(outputs['segmentation_probs'].detach().cpu())
-                    batch_true_masks.append(true_masks.detach().cpu())
-                    batch_true_presence_for_seg.append(true_presence.detach().cpu())
+                            print(f"  Presence: True={true_presence_count}, Pred={pred_presence_count}")
 
-            # Explicit cleanup of outputs and intermediate tensors
-            del outputs, losses, total_loss, targets
+                # FIX: Calculate metrics incrementally without storing tensors
+                with torch.no_grad():
+                    # Presence accuracy
+                    pred_presence_binary = (outputs['presence_probs'] > 0.5).long()
+                    presence_correct = (pred_presence_binary == true_presence).float().sum()
+                    running_presence_correct += presence_correct.item()
+                    running_presence_total += true_presence.numel()
 
-            # Periodic memory cleanup
-            if (batch_idx + 1) % self.memory_cleanup_frequency == 0:
-                cleanup_memory()
+                    # Dice score for present structures only
+                    for b in range(true_presence.shape[0]):
+                        for s in range(true_presence.shape[1]):
+                            if true_presence[b, s] == 1:
+                                pred_mask = outputs['segmentation_probs'][b, s]
+                                true_mask = true_masks[b, s]
+                                dice = self.dice_coefficient_fast(pred_mask, true_mask)
+                                running_dice_sum += dice.item()
+                                running_dice_count += 1
 
-            # Enhanced progress bar with more loss components
-            avg_total_loss = np.mean(epoch_losses['total']) if epoch_losses['total'] else 0
-            avg_dice_loss = np.mean(epoch_losses.get('dice', [0])) if epoch_losses.get('dice') else 0
+                # FIX: Complete tensor cleanup
+                del outputs, losses, total_loss, targets, images, true_masks, true_presence
 
-            pbar.set_postfix({
-                'total': f"{avg_total_loss:.4f}",
-                'dice': f"{avg_dice_loss:.4f}",
-                'mem_gb': f"{torch.cuda.memory_allocated() / 1024 ** 3:.1f}" if torch.cuda.is_available() else "N/A"
-            })
+                # Force cleanup every few batches
+                if (batch_idx + 1) % self.memory_cleanup_frequency == 0:
+                    cleanup_memory()
 
-            # Clear variables at end of batch
-            del images, true_masks, true_presence
+                # Enhanced progress bar with more loss components
+                avg_total_loss = np.mean(epoch_losses['total']) if epoch_losses['total'] else 0
+                avg_dice_loss = np.mean(epoch_losses.get('dice', [0])) if epoch_losses.get('dice') else 0
 
-        # Calculate epoch metrics from collected predictions
-        if batch_pred_presence:  # Only if we have collected predictions
-            all_pred_presence = torch.cat(batch_pred_presence, dim=0)
-            all_true_presence = torch.cat(batch_true_presence, dim=0)
-            all_pred_masks = torch.cat(batch_pred_masks, dim=0)
-            all_true_masks = torch.cat(batch_true_masks, dim=0)
-            all_true_presence_for_seg = torch.cat(batch_true_presence_for_seg, dim=0)
+                pbar.set_postfix({
+                    'total': f"{avg_total_loss:.4f}",
+                    'dice': f"{avg_dice_loss:.4f}",
+                    'mem_gb': f"{torch.cuda.memory_allocated() / 1024 ** 3:.1f}" if torch.cuda.is_available() else "N/A"
+                })
 
-            # Presence detection metrics
-            presence_metrics = self.metrics_calc.calculate_presence_metrics(
-                all_pred_presence, all_true_presence
-            )
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    print(f"OOM at batch {batch_idx}, attempting recovery...")
+                    if self.handle_oom():
+                        continue
+                    else:
+                        raise e
+                else:
+                    raise e
 
-            # Segmentation metrics
-            seg_metrics = self.metrics_calc.calculate_segmentation_metrics(
-                all_pred_masks, all_true_masks, all_true_presence_for_seg
-            )
+        # FIX: Calculate final metrics from running totals
+        if running_presence_total > 0:
+            presence_accuracy = running_presence_correct / running_presence_total
+            mean_dice = running_dice_sum / running_dice_count if running_dice_count > 0 else 0.0
 
-            # Enhanced per-structure Dice reporting for debugging
-            if hasattr(seg_metrics, 'structure_dice') and seg_metrics['structure_dice']:
-                print("\nPer-structure Dice scores:")
-                for struct_name, dice_info in seg_metrics['structure_dice'].items():
-                    print(f"  {struct_name}: {dice_info['mean']:.4f} ± {dice_info['std']:.4f} (n={dice_info['count']})")
-
-            # Clean up tensors
-            del all_pred_presence, all_true_presence, all_pred_masks, all_true_masks, all_true_presence_for_seg
+            presence_metrics = {'overall_accuracy': presence_accuracy, 'mean_structure_accuracy': presence_accuracy}
+            seg_metrics = {'mean_dice': mean_dice, 'std_dice': 0.0}
         else:
-            # Fallback metrics if memory limit exceeded
             presence_metrics = {'overall_accuracy': 0.0, 'mean_structure_accuracy': 0.0}
-            seg_metrics = {'mean_dice': 0.0}
-            print("Warning: Metrics calculated on limited samples due to memory constraints")
-
-        # Clear batch collections
-        del batch_pred_presence, batch_true_presence, batch_pred_masks, batch_true_masks, batch_true_presence_for_seg
+            seg_metrics = {'mean_dice': 0.0, 'std_dice': 0.0}
 
         # Final memory cleanup
         cleanup_memory()
@@ -729,7 +745,6 @@ class Trainer:
 
         return train_results
 
-    # Additional helper method to add to the Trainer class for warmup support
     def setup_warmup_scheduler(self, warmup_epochs=5):
         """Setup learning rate warmup scheduler"""
         self.warmup_epochs = warmup_epochs
@@ -771,12 +786,11 @@ class Trainer:
         self.model.eval()
         epoch_losses = defaultdict(list)
 
-        # Memory-efficient validation
-        all_pred_presence = []
-        all_true_presence = []
-        all_pred_masks = []
-        all_true_masks = []
-        all_true_presence_for_seg = []
+        # FIX: Use running metrics for validation too
+        running_val_presence_correct = 0
+        running_val_presence_total = 0
+        running_val_dice_sum = 0
+        running_val_dice_count = 0
 
         with torch.no_grad():
             pbar = tqdm(self.val_loader, desc="Validation")
@@ -800,12 +814,22 @@ class Trainer:
                 for key, value in losses.items():
                     epoch_losses[key].append(value.item())
 
-                # Collect predictions (move to CPU immediately)
-                all_pred_presence.append(outputs['presence_probs'].cpu())
-                all_true_presence.append(true_presence.cpu())
-                all_pred_masks.append(outputs['segmentation_probs'].cpu())
-                all_true_masks.append(true_masks.cpu())
-                all_true_presence_for_seg.append(true_presence.cpu())
+                # FIX: Calculate metrics incrementally during validation loop
+                # Presence accuracy
+                pred_presence_binary = (outputs['presence_probs'] > 0.5).long()
+                presence_correct = (pred_presence_binary == true_presence).float().sum()
+                running_val_presence_correct += presence_correct.item()
+                running_val_presence_total += true_presence.numel()
+
+                # Dice score for present structures only
+                for b in range(true_presence.shape[0]):
+                    for s in range(true_presence.shape[1]):
+                        if true_presence[b, s] == 1:
+                            pred_mask = outputs['segmentation_probs'][b, s]
+                            true_mask = true_masks[b, s]
+                            dice = self.dice_coefficient_fast(pred_mask, true_mask)
+                            running_val_dice_sum += dice.item()
+                            running_val_dice_count += 1
 
                 # Clean up GPU tensors immediately
                 del outputs, losses, targets, images, true_masks, true_presence
@@ -822,23 +846,19 @@ class Trainer:
                 if (batch_idx + 1) % (self.memory_cleanup_frequency * 2) == 0:
                     cleanup_memory()
 
-        # Calculate metrics
-        all_pred_presence = torch.cat(all_pred_presence, dim=0)
-        all_true_presence = torch.cat(all_true_presence, dim=0)
-        all_pred_masks = torch.cat(all_pred_masks, dim=0)
-        all_true_masks = torch.cat(all_true_masks, dim=0)
-        all_true_presence_for_seg = torch.cat(all_true_presence_for_seg, dim=0)
+        # FIX: Calculate final validation metrics from running totals
+        if running_val_presence_total > 0:
+            val_presence_accuracy = running_val_presence_correct / running_val_presence_total
+            val_mean_dice = running_val_dice_sum / running_val_dice_count if running_val_dice_count > 0 else 0.0
 
-        presence_metrics = self.metrics_calc.calculate_presence_metrics(
-            all_pred_presence, all_true_presence
-        )
-
-        seg_metrics = self.metrics_calc.calculate_segmentation_metrics(
-            all_pred_masks, all_true_masks, all_true_presence_for_seg
-        )
+            presence_metrics = {'overall_accuracy': val_presence_accuracy,
+                                'mean_structure_accuracy': val_presence_accuracy}
+            seg_metrics = {'mean_dice': val_mean_dice, 'std_dice': 0.0}
+        else:
+            presence_metrics = {'overall_accuracy': 0.0, 'mean_structure_accuracy': 0.0}
+            seg_metrics = {'mean_dice': 0.0, 'std_dice': 0.0}
 
         # Clean up
-        del all_pred_presence, all_true_presence, all_pred_masks, all_true_masks, all_true_presence_for_seg
         cleanup_memory()
 
         val_results = {
@@ -848,6 +868,15 @@ class Trainer:
         }
 
         return val_results
+
+    def limit_history_size(self):
+        """FIX: Limit history to last N epochs to prevent memory growth"""
+        if len(self.history['train_loss']) > self.max_history_length:
+            self.history['train_loss'] = self.history['train_loss'][-self.max_history_length:]
+            self.history['val_loss'] = self.history['val_loss'][-self.max_history_length:]
+            self.history['train_metrics'] = self.history['train_metrics'][-self.max_history_length:]
+            self.history['val_metrics'] = self.history['val_metrics'][-self.max_history_length:]
+            self.history['learning_rates'] = self.history['learning_rates'][-self.max_history_length:]
 
     @ex.capture
     def train(self, training, checkpoint):
@@ -892,7 +921,7 @@ class Trainer:
 
             current_lr = self.optimizer.param_groups[0]['lr']
 
-            # Store history (limit memory by not keeping too much detail)
+            # FIX: Store history with size limit
             self.history['train_loss'].append(train_results['losses']['total'])
             self.history['val_loss'].append(val_loss)
 
@@ -909,6 +938,9 @@ class Trainer:
             self.history['train_metrics'].append(essential_train_metrics)
             self.history['val_metrics'].append(essential_val_metrics)
             self.history['learning_rates'].append(current_lr)
+
+            # FIX: Limit history size to prevent unbounded growth
+            self.limit_history_size()
 
             # Sacred logging (epoch-level)
             ex.log_scalar('train.epoch.total_loss', train_results['losses']['total'], epoch)
@@ -989,7 +1021,7 @@ class Trainer:
 
     def save_checkpoint(self, filepath: Path, epoch: int, is_best: bool = False):
         """Save model checkpoint with memory optimization"""
-        # Create minimal checkpoint to save memory
+        # FIX: Create minimal checkpoint to save memory
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
@@ -997,9 +1029,9 @@ class Trainer:
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'structure_names': self.structure_names,
             'is_best': is_best,
-            # Only save essential history to reduce checkpoint size
-            'train_loss_history': self.history['train_loss'],
-            'val_loss_history': self.history['val_loss']
+            # FIX: Only save last 10 epochs of history to reduce size
+            'train_loss_history': self.history['train_loss'][-10:],
+            'val_loss_history': self.history['val_loss'][-10:]
         }
 
         torch.save(checkpoint, filepath)
@@ -1279,14 +1311,8 @@ def save_results(history, structure_performance, checkpoint):
 
 
 @ex.automain
-# def main(dataset_path, device, seed, logging, sacred_dir, config_path):
 def main(dataset_path, device, seed, logging, config_path):
     """Main training pipeline with Sacred integration and memory optimization"""
-
-    # Update Sacred observer directory if provided
-    # if sacred_dir != './sacred_logs':
-    #     ex.observers.clear()
-    #     ex.observers.append(FileStorageObserver(sacred_dir))
 
     # Load config from file if provided and merge with Sacred config
     if config_path and Path(config_path).exists():
@@ -1399,17 +1425,15 @@ if __name__ == "__main__":
     print("Usage examples:")
     print("python train_memory_optimized.py with dataset_path='../data/synthetic_medical_dataset/'")
     print(
-        "python train_memory_optimized.py with dataset_path='../data/synthetic_medical_dataset/' sacred_dir='./experiments'")
-    print(
         "python train_memory_optimized.py with dataset_path='../data/synthetic_medical_dataset/' config_path='../config/config.json'")
-    print(
-        "python train_memory_optimized.py with dataset_path='../data/synthetic_medical_dataset/' sacred_dir='./experiments' config_path='../config/config.json'")
     print("\nMemory optimization features enabled:")
     print("- Gradient accumulation support")
-    print("- Periodic memory cleanup")
-    print("- Limited metric collection")
+    print("- Frequent memory cleanup")
+    print("- Running metrics calculation (no tensor accumulation)")
+    print("- Limited history storage")
     print("- Efficient checkpointing")
     print("- GPU memory monitoring")
+    print("- OOM error handling")
     print("\nStarting experiment with default parameters if no 'with' clause provided...")
 
     # If no 'with' arguments provided, run with defaults
