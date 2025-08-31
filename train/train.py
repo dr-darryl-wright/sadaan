@@ -511,7 +511,6 @@ class Trainer:
 
     @ex.capture
     def train_epoch(self, logging) -> Dict:
-        """Train for one epoch with memory optimization"""
         """Train for one epoch with improved loss handling and diagnostics"""
         self.model.train()
         epoch_losses = defaultdict(list)
@@ -589,7 +588,6 @@ class Trainer:
                 accumulated_loss = 0
 
             # Store losses (only actual loss values, not scaled)
-            # Store losses (only actual loss values, not scaled)
             for key, value in losses.items():
                 # Handle both tensors and floats
                 if hasattr(value, 'item'):
@@ -597,7 +595,6 @@ class Trainer:
                 else:
                     epoch_losses[key].append(float(value))
 
-            # Enhanced Sacred logging with all loss components
             # Enhanced Sacred logging with all loss components
             if self.global_step % logging.get('log_frequency', 1) == 0:
                 for key, value in losses.items():

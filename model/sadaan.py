@@ -392,30 +392,6 @@ def create_sample_data(batch_size: int = 2, num_structures: int = 5):
     return x, targets
 
 
-# Example usage and training setup
-def __init__(self, structure_names, weights=None, focal_alpha=0.25, focal_gamma=2.0):
-    super().__init__()
-    self.structure_names = structure_names
-    self.num_structures = len(structure_names)
-
-    # Default weights
-    default_weights = {
-        'segmentation': 1.0,
-        'absence': 1.0,
-        'attention_supervision': 0.5,
-        'confidence': 0.1,
-        'focal_seg': 0.5  # New focal loss weight
-    }
-
-    self.weights = weights if weights else default_weights
-    self.focal_alpha = focal_alpha
-    self.focal_gamma = focal_gamma
-
-    # BCE with logits for numerical stability
-    self.bce_with_logits = torch.nn.BCEWithLogitsLoss(reduction='none')
-    self.bce = torch.nn.BCELoss(reduction='none')
-
-
 if __name__ == "__main__":
     # Initialize model
     structure_names = ['left_kidney', 'right_kidney', 'liver', 'spleen', 'pancreas']
