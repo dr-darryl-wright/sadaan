@@ -539,16 +539,16 @@ class Trainer:
                 with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                     outputs = self.model(images)
 
-                    targets = {
-                        'segmentation_targets': true_masks,
-                        'presence_targets': true_presence
-                    }
+                targets = {
+                    'segmentation_targets': true_masks,
+                    'presence_targets': true_presence
+                }
 
-                    losses = self.loss_fn(outputs, targets)
-                    total_loss = losses['total']
+                losses = self.loss_fn(outputs, targets)
+                total_loss = losses['total']
 
-                    if self.gradient_accumulation_steps > 1:
-                        total_loss = total_loss / self.gradient_accumulation_steps
+                if self.gradient_accumulation_steps > 1:
+                    total_loss = total_loss / self.gradient_accumulation_steps
 
                 # Backward pass
                 total_loss.backward()
