@@ -1353,6 +1353,7 @@ def main(dataset_path, device, seed, logging, config_path):
     # Load datasets
     print("Loading datasets...")
     train_loader, val_loader, structure_names, image_size = create_data_loaders()
+
     print(f"Loaded dataset with {len(structure_names)} structures")
     print(f"Structure names: {structure_names}")
 
