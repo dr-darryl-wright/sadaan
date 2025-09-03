@@ -405,8 +405,10 @@ def create_data_loaders(dataset_path, training, augmentation):
         batch_size=training['batch_size'],
         shuffle=True,
         num_workers=training['num_workers'],
-        pin_memory=True if torch.cuda.is_available() else False,
-        persistent_workers=True if training['num_workers'] > 0 else False,  # Keep workers alive
+        #pin_memory=True if torch.cuda.is_available() else False,
+        #persistent_workers=True if training['num_workers'] > 0 else False,  # Keep workers alive
+        pin_memory=False,
+        persistent_workers=False,
         drop_last=True  # Drop incomplete batches to ensure consistent memory usage
     )
 
