@@ -4,8 +4,11 @@ from typing import Dict, List, Tuple, Optional
 import matplotlib.pyplot as plt
 from pathlib import Path
 import json
+import h5py
 from dataclasses import dataclass
 from sklearn.model_selection import train_test_split
+import torch
+from torch.utils.data import Dataset, DataLoader
 
 
 @dataclass
@@ -288,7 +291,7 @@ class SyntheticAnatomyGenerator:
 
 
 class SyntheticDatasetGenerator:
-    """Generate complete datasets for training and testing"""
+    """Generate complete datasets for training and testing with HDF5 support"""
 
     def __init__(self, image_size: Tuple[int, int, int] = (128, 128, 64)):
         self.generator = SyntheticAnatomyGenerator(image_size)
@@ -488,29 +491,54 @@ class SyntheticDatasetGenerator:
 
         return dataset
 
-    def save_dataset(self, dataset: Dict, output_dir: str):
-        """Save dataset to disk"""
+    def save_dataset_hdf5(self, dataset: Dict, output_dir: str):
+        """Save dataset in HDF5 format for memory-efficient loading"""
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
-        # Save as compressed numpy files
+        print("Saving dataset in HDF5 format...")
+
         for split in ['train', 'val', 'test']:
-            if split in dataset:
-                split_path = output_path / split
-                split_path.mkdir(exist_ok=True)
+            if split not in dataset:
+                continue
 
-                np.savez_compressed(
-                    split_path / 'data.npz',
-                    images=dataset[split]['images'],
-                    masks=dataset[split]['masks'],
-                    presence_labels=dataset[split]['presence_labels']
-                )
+            print(f"  Saving {split} split...")
+            split_file = output_path / f'{split}.h5'
 
-                # Save scenarios as JSON
-                with open(split_path / 'scenarios.json', 'w') as f:
-                    json.dump(dataset[split]['scenarios'], f)
+            with h5py.File(split_file, 'w') as f:
+                # Create datasets with compression and chunking for efficient access
+                # Chunk by individual samples for efficient random access
+                chunk_size = (1, *dataset[split]['images'].shape[1:])
 
-        # Save metadata
+                f.create_dataset('images',
+                                 data=dataset[split]['images'],
+                                 compression='gzip',
+                                 compression_opts=6,  # Good balance of compression/speed
+                                 chunks=chunk_size)
+
+                # Chunk masks by sample as well
+                mask_chunk_size = (1, *dataset[split]['masks'].shape[1:])
+                f.create_dataset('masks',
+                                 data=dataset[split]['masks'],
+                                 compression='gzip',
+                                 compression_opts=6,
+                                 chunks=mask_chunk_size)
+
+                f.create_dataset('presence_labels',
+                                 data=dataset[split]['presence_labels'],
+                                 compression='gzip',
+                                 compression_opts=6)
+
+                # Store scenarios as strings (HDF5 handles string arrays)
+                scenarios_array = np.array(dataset[split]['scenarios'], dtype=h5py.string_dtype())
+                f.create_dataset('scenarios', data=scenarios_array)
+
+                # Store metadata as attributes
+                f.attrs['n_samples'] = len(dataset[split]['images'])
+                f.attrs['image_shape'] = dataset[split]['images'].shape[1:]
+                f.attrs['n_structures'] = len(dataset['structure_names'])
+
+        # Save metadata as JSON for easy access
         metadata = {
             'structure_names': dataset['structure_names'],
             'image_size': dataset['image_size'],
@@ -521,12 +549,160 @@ class SyntheticDatasetGenerator:
         with open(output_path / 'metadata.json', 'w') as f:
             json.dump(metadata, f, indent=2)
 
-        print(f"Dataset saved to {output_path}")
+        print(f"HDF5 dataset saved to {output_path}")
+
+    def save_dataset(self, dataset: Dict, output_dir: str):
+        """Save dataset - defaults to HDF5 format"""
+        self.save_dataset_hdf5(dataset, output_dir)
 
 
-def visualize_sample(image: np.ndarray, masks: Dict[str, np.ndarray],
-                     presence_labels: Dict[str, int], slice_idx: Optional[int] = None):
-    """Visualize a single sample"""
+class LazyMedicalDataset(Dataset):
+    """PyTorch Dataset that loads samples on-demand from HDF5"""
+
+    def __init__(self, data_path: str, split: str = 'train',
+                 transform=None, load_masks: bool = True,
+                 preload_metadata: bool = True):
+        """
+        Args:
+            data_path: Path to the HDF5 dataset directory
+            split: Dataset split ('train', 'val', 'test')
+            transform: Optional transform function
+            load_masks: Whether to load segmentation masks (set False for classification only)
+            preload_metadata: Whether to preload scenarios for faster access
+        """
+        self.data_path = Path(data_path)
+        self.split = split
+        self.transform = transform
+        self.load_masks = load_masks
+
+        # Load metadata
+        with open(self.data_path / 'metadata.json', 'r') as f:
+            self.metadata = json.load(f)
+
+        self.structure_names = self.metadata['structure_names']
+        self.image_size = self.metadata['image_size']
+
+        # Open HDF5 file
+        self.hdf5_path = self.data_path / f'{self.split}.h5'
+        if not self.hdf5_path.exists():
+            raise FileNotFoundError(f"HDF5 file not found: {self.hdf5_path}")
+
+        # Open file and get basic info
+        self.hdf5_file = h5py.File(self.hdf5_path, 'r')
+        self.n_samples = self.hdf5_file.attrs['n_samples']
+
+        # Optionally preload scenarios for faster access
+        if preload_metadata:
+            self.scenarios = [s.decode('utf-8') if isinstance(s, bytes) else s
+                              for s in self.hdf5_file['scenarios'][:]]
+        else:
+            self.scenarios = None
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        if idx >= self.n_samples:
+            raise IndexError(f"Index {idx} out of range for dataset of size {self.n_samples}")
+
+        # Load image - HDF5 efficiently loads only the requested slice
+        image = self.hdf5_file['images'][idx]
+        presence_labels = self.hdf5_file['presence_labels'][idx]
+
+        # Optionally load masks
+        if self.load_masks:
+            masks = self.hdf5_file['masks'][idx]
+        else:
+            masks = None
+
+        # Get scenario if needed
+        if self.scenarios is not None:
+            scenario = self.scenarios[idx]
+        else:
+            scenario_bytes = self.hdf5_file['scenarios'][idx]
+            scenario = scenario_bytes.decode('utf-8') if isinstance(scenario_bytes, bytes) else scenario_bytes
+
+        # Apply transforms if specified
+        if self.transform:
+            if masks is not None:
+                image, masks = self.transform(image, masks)
+            else:
+                image = self.transform(image)
+
+        # Convert to torch tensors
+        image = torch.from_numpy(image.astype(np.float32))
+        presence_labels = torch.from_numpy(presence_labels.astype(np.int64))
+
+        if masks is not None:
+            masks = torch.from_numpy(masks.astype(np.bool_))
+            return {
+                'image': image,
+                'masks': masks,
+                'presence_labels': presence_labels,
+                'scenario': scenario,
+                'index': idx
+            }
+        else:
+            return {
+                'image': image,
+                'presence_labels': presence_labels,
+                'scenario': scenario,
+                'index': idx
+            }
+
+    def __del__(self):
+        """Clean up HDF5 file handle"""
+        if hasattr(self, 'hdf5_file'):
+            self.hdf5_file.close()
+
+    def get_structure_names(self):
+        """Get list of anatomical structure names"""
+        return self.structure_names
+
+    def get_class_distribution(self):
+        """Get distribution of presence labels across the dataset"""
+        presence_labels = self.hdf5_file['presence_labels'][:]
+        presence_counts = presence_labels.sum(axis=0)
+
+        distribution = {}
+        for i, struct_name in enumerate(self.structure_names):
+            distribution[struct_name] = {
+                'present': int(presence_counts[i]),
+                'absent': int(self.n_samples - presence_counts[i]),
+                'presence_rate': float(presence_counts[i] / self.n_samples)
+            }
+
+        return distribution
+
+
+def create_data_transforms():
+    """Create example data transforms"""
+
+    def basic_transform(image, masks=None):
+        # Example: Add channel dimension for 2D CNNs or normalize
+        # For 3D data, you might want to extract 2D slices
+
+        # Normalize to [0, 1]
+        image = image / 255.0
+
+        # Add channel dimension if needed (for 2D processing)
+        # image = image[..., None]
+
+        if masks is not None:
+            return image, masks
+        else:
+            return image
+
+    return basic_transform
+
+
+def visualize_sample(dataset: LazyMedicalDataset, idx: int, slice_idx: Optional[int] = None):
+    """Visualize a single sample from the lazy dataset"""
+    sample = dataset[idx]
+
+    image = sample['image'].numpy()
+    presence_labels = sample['presence_labels'].numpy()
+    scenario = sample['scenario']
 
     if slice_idx is None:
         slice_idx = image.shape[-1] // 2
@@ -540,38 +716,41 @@ def visualize_sample(image: np.ndarray, masks: Dict[str, np.ndarray],
 
     # Show original image
     axes[0].imshow(img_slice, cmap='gray')
-    axes[0].set_title('Original Image')
+    axes[0].set_title(f'Original Image\nScenario: {scenario}')
     axes[0].axis('off')
 
-    # Show overlaid structures
-    overlay = img_slice.copy()
+    # Show presence labels as text
+    present_structures = [name for name, present in zip(dataset.structure_names, presence_labels) if present]
+    absent_structures = [name for name, present in zip(dataset.structure_names, presence_labels) if not present]
 
-    for i, (struct_name, mask) in enumerate(masks.items()):
-        if presence_labels[struct_name] == 1 and mask.any():
-            mask_slice = mask[..., slice_idx]
-            mask_slice = np.rot90(mask_slice, -1)
-            overlay[mask_slice] = 255
-
-    axes[1].imshow(overlay, cmap='gray')
-    axes[1].set_title('All Structures')
+    axes[1].text(0.05, 0.95, f"Present ({len(present_structures)}):\n" + "\n".join(present_structures),
+                 transform=axes[1].transAxes, fontsize=8, verticalalignment='top', color='green')
+    axes[1].text(0.55, 0.95, f"Absent ({len(absent_structures)}):\n" + "\n".join(absent_structures),
+                 transform=axes[1].transAxes, fontsize=8, verticalalignment='top', color='red')
+    axes[1].set_title('Structure Status')
     axes[1].axis('off')
 
-    # Show individual structures
-    plot_idx = 2
-    for struct_name, mask in list(masks.items())[:6]:
-        if plot_idx >= 8:
-            break
+    # Show individual masks if available
+    if 'masks' in sample:
+        masks = sample['masks'].numpy()
 
-        mask_slice = mask[..., slice_idx]
-        mask_slice = np.rot90(mask_slice, -1)
-        masked_img = img_slice.copy()
-        masked_img[~mask_slice] = 0
+        plot_idx = 2
+        for i, struct_name in enumerate(dataset.structure_names[:6]):
+            if plot_idx >= 8:
+                break
 
-        status = "Present" if presence_labels[struct_name] == 1 else "Absent"
-        axes[plot_idx].imshow(masked_img, cmap='gray')
-        axes[plot_idx].set_title(f'{struct_name}\n({status})')
-        axes[plot_idx].axis('off')
-        plot_idx += 1
+            mask_slice = masks[i, ..., slice_idx]
+            mask_slice = np.rot90(mask_slice, -1)
+            masked_img = img_slice.copy()
+            masked_img[~mask_slice] = 0
+
+            status = "Present" if presence_labels[i] == 1 else "Absent"
+            color = 'green' if presence_labels[i] == 1 else 'red'
+
+            axes[plot_idx].imshow(masked_img, cmap='gray')
+            axes[plot_idx].set_title(f'{struct_name}\n({status})', color=color)
+            axes[plot_idx].axis('off')
+            plot_idx += 1
 
     # Hide unused subplots
     for i in range(plot_idx, 8):
@@ -581,15 +760,110 @@ def visualize_sample(image: np.ndarray, masks: Dict[str, np.ndarray],
     plt.show()
 
 
+def example_training_loop():
+    """Example training loop using the lazy HDF5 dataset"""
+
+    # Create datasets
+    train_dataset = LazyMedicalDataset(
+        "../data/synthetic_medical_dataset_hdf5",
+        split='train',
+        load_masks=False,  # Set to True if you need segmentation masks
+        transform=create_data_transforms()
+    )
+
+    val_dataset = LazyMedicalDataset(
+        "../data/synthetic_medical_dataset_hdf5",
+        split='val',
+        load_masks=False,
+        transform=create_data_transforms()
+    )
+
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=32,
+        shuffle=True,
+        num_workers=4,  # Adjust based on your system
+        pin_memory=True,
+        persistent_workers=True  # Keeps workers alive between epochs
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=32,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True
+    )
+
+    print("Dataset Information:")
+    print(f"Training samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
+    print(f"Structures: {train_dataset.get_structure_names()}")
+
+    # Print class distribution
+    print("\nClass Distribution (Training):")
+    distribution = train_dataset.get_class_distribution()
+    for struct_name, stats in distribution.items():
+        print(f"  {struct_name}: {stats['presence_rate']:.1%} present ({stats['present']}/{len(train_dataset)})")
+
+    # Example training loop
+    print("\nStarting training loop example...")
+
+    for epoch in range(3):  # Just 3 epochs for demo
+        print(f"\nEpoch {epoch + 1}/3")
+
+        # Training phase
+        train_total = 0
+        for batch_idx, batch in enumerate(train_loader):
+            images = batch['image']  # Shape: [batch_size, H, W, D]
+            presence_labels = batch['presence_labels']  # Shape: [batch_size, n_structures]
+            scenarios = batch['scenario']  # List of scenario names
+
+            # Your model training code would go here
+            # model_output = model(images)
+            # loss = criterion(model_output, presence_labels)
+            # loss.backward()
+            # optimizer.step()
+
+            train_total += len(images)
+
+            if batch_idx % 10 == 0:  # Print every 10 batches
+                print(f"  Train batch {batch_idx}: {len(images)} samples, "
+                      f"Total processed: {train_total}/{len(train_dataset)}")
+
+            if batch_idx >= 5:  # Just process a few batches for demo
+                break
+
+        # Validation phase
+        val_total = 0
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(val_loader):
+                images = batch['image']
+                presence_labels = batch['presence_labels']
+
+                # Your model evaluation code would go here
+                # model_output = model(images)
+                # val_loss = criterion(model_output, presence_labels)
+
+                val_total += len(images)
+
+                if batch_idx >= 2:  # Just process a few batches for demo
+                    break
+
+        print(f"  Validation: {val_total} samples processed")
+
+
 # Example usage and testing
 if __name__ == "__main__":
     # Create dataset generator
     generator = SyntheticDatasetGenerator(image_size=(128, 128, 64))
 
-    # Generate small test dataset
+    # Generate dataset
     print("Generating synthetic dataset...")
     dataset = generator.generate_dataset(
-        total_samples=1000,  # Small for testing
+        total_samples=1000,  # You can increase this for real training
         validation_split=0.2,
         test_split=0.1,
         position_noise=0.05,
@@ -617,41 +891,59 @@ if __name__ == "__main__":
             print(f"    Presence rates: {dict(zip(dataset['structure_names'], presence_rates))}")
             print()
 
-    # Visualize some samples
-    print("Visualizing samples...")
+    # Save dataset in HDF5 format
+    print("Saving dataset in HDF5 format...")
+    generator.save_dataset_hdf5(dataset, '../data/synthetic_medical_dataset_hdf5')
+    print("Dataset saved!")
 
-    # Show normal case
-    train_data = dataset['train']
-    normal_indices = [i for i, s in enumerate(train_data['scenarios']) if 'normal' in s]
-    if normal_indices:
-        idx = normal_indices[0]
-        image = train_data['images'][idx]
+    # Test the lazy loading
+    print("\nTesting lazy loading...")
 
-        # Convert masks back to dict format
-        masks = {}
-        presence_labels = {}
-        for j, struct_name in enumerate(dataset['structure_names']):
-            masks[struct_name] = train_data['masks'][idx, j]
-            presence_labels[struct_name] = train_data['presence_labels'][idx, j]
+    try:
+        # Create lazy dataset
+        lazy_dataset = LazyMedicalDataset(
+            '../data/synthetic_medical_dataset_hdf5',
+            split='train',
+            load_masks=True,
+            preload_metadata=True
+        )
 
-        print(f"Sample scenario: {train_data['scenarios'][idx]}")
-        visualize_sample(image, masks, presence_labels)
+        print(f"Lazy dataset created with {len(lazy_dataset)} samples")
 
-    # Show absence case
-    absence_indices = [i for i, s in enumerate(train_data['scenarios']) if 'nephrectomy' in s]
-    if absence_indices:
-        idx = absence_indices[0]
-        image = train_data['images'][idx]
+        # Test loading a few samples
+        print("Testing sample loading...")
+        for i in [0, 10, 50]:
+            if i < len(lazy_dataset):
+                sample = lazy_dataset[i]
+                print(f"  Sample {i}: scenario={sample['scenario']}, "
+                      f"image_shape={sample['image'].shape}, "
+                      f"n_present_structures={sample['presence_labels'].sum().item()}")
 
-        masks = {}
-        presence_labels = {}
-        for j, struct_name in enumerate(dataset['structure_names']):
-            masks[struct_name] = train_data['masks'][idx, j]
-            presence_labels[struct_name] = train_data['presence_labels'][idx, j]
+        # Visualize some samples
+        print("\nVisualizing samples...")
 
-        print(f"Sample scenario: {train_data['scenarios'][idx]}")
-        visualize_sample(image, masks, presence_labels)
+        # Find a normal case
+        for i in range(min(20, len(lazy_dataset))):
+            sample = lazy_dataset[i]
+            if 'normal' in sample['scenario']:
+                print(f"Visualizing normal case: {sample['scenario']}")
+                visualize_sample(lazy_dataset, i)
+                break
 
-    # Save dataset
-    generator.save_dataset(dataset, '../data/synthetic_medical_dataset')
-    print("\nDataset generation complete!")
+        # Find an abnormal case
+        for i in range(min(50, len(lazy_dataset))):
+            sample = lazy_dataset[i]
+            if 'nephrectomy' in sample['scenario']:
+                print(f"Visualizing abnormal case: {sample['scenario']}")
+                visualize_sample(lazy_dataset, i)
+                break
+
+        # Test the training loop
+        print("\nTesting training loop...")
+        example_training_loop()
+
+    except FileNotFoundError as e:
+        print(f"Could not test lazy loading: {e}")
+        print("Make sure to run the dataset generation first!")
+
+    print("\nScript completed successfully!")
