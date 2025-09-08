@@ -21,7 +21,6 @@ from tqdm import tqdm
 import warnings
 
 warnings.filterwarnings('ignore')
-import gc
 
 # Import your model and dataset classes
 import sys
@@ -45,18 +44,23 @@ class HDF5MedicalDataset(torch.utils.data.Dataset):
         self.data_path = Path(data_path)
         self.split = split
         self.transform = transform
+
         # Load metadata
         with open(self.data_path / 'metadata.json', 'r') as f:
             self.metadata = json.load(f)
+
         self.structure_names = self.metadata['structure_names']
         self.image_size = self.metadata['image_size']
+
         # Open HDF5 file
         self.hdf5_path = self.data_path / f'{self.split}.h5'
         if not self.hdf5_path.exists():
             raise FileNotFoundError(f"HDF5 file not found: {self.hdf5_path}")
+
         # Open file and get basic info
         self.hdf5_file = h5py.File(self.hdf5_path, 'r')
         self.n_samples = self.hdf5_file.attrs['n_samples']
+
         # Preload scenarios for faster access
         self.scenarios = [s.decode('utf-8') if isinstance(s, bytes) else s
                           for s in self.hdf5_file['scenarios'][:]]
@@ -67,20 +71,25 @@ class HDF5MedicalDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         if idx >= self.n_samples:
             raise IndexError(f"Index {idx} out of range for dataset of size {self.n_samples}")
+
         # Load image and labels
         image = self.hdf5_file['images'][idx]
         masks = self.hdf5_file['masks'][idx]
         presence_labels = self.hdf5_file['presence_labels'][idx]
         scenario = self.scenarios[idx]
+
         # Apply transforms if specified
         if self.transform:
             image = self.transform(image)
+
         # Convert to torch tensors
         image = torch.from_numpy(image.astype(np.float32))
         masks = torch.from_numpy(masks.astype(np.float32))
         presence_labels = torch.from_numpy(presence_labels.astype(np.int64))
+
         # Add channel dimension to image
         image = image.unsqueeze(0)  # [1, H, W, D]
+
         return {
             'image': image,
             'masks': masks,
@@ -95,8 +104,8 @@ class HDF5MedicalDataset(torch.utils.data.Dataset):
             self.hdf5_file.close()
 
 
-class MemoryOptimizedModelEvaluator:
-    """Memory-optimized comprehensive model evaluation with visualizations"""
+class ModelEvaluator:
+    """Comprehensive model evaluation with visualizations"""
 
     def __init__(self, model, device, structure_names, output_dir='./test_results'):
         self.model = model
@@ -105,23 +114,18 @@ class MemoryOptimizedModelEvaluator:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Initialize result storage (only store what's needed for visualizations)
+        # Initialize result storage
         self.results = {
+            'predictions': [],
+            'targets': [],
             'presence_predictions': [],
             'presence_targets': [],
+            'segmentation_predictions': [],
+            'segmentation_targets': [],
             'scenarios': [],
             'sample_indices': [],
+            'images': [],
             'confidence_scores': []
-        }
-
-        # Store limited samples for visualization
-        self.sample_visualizations = []
-        self.max_vis_samples = 50
-
-        # Initialize running metrics for segmentation (to avoid storing all data)
-        self.segmentation_metrics = {
-            struct_name: {'dice_scores': [], 'iou_scores': [], 'num_samples': 0}
-            for struct_name in structure_names
         }
 
     def dice_coefficient(self, pred_mask, true_mask, epsilon=1e-6):
@@ -142,7 +146,7 @@ class MemoryOptimizedModelEvaluator:
         return (intersection + epsilon) / (union + epsilon)
 
     def evaluate_batch(self, batch):
-        """Evaluate a single batch and store results efficiently"""
+        """Evaluate a single batch and store results"""
         self.model.eval()
 
         with torch.no_grad():
@@ -159,7 +163,11 @@ class MemoryOptimizedModelEvaluator:
             batch_size = images.shape[0]
             for i in range(batch_size):
                 # Convert to numpy for storage
+                image_np = images[i].cpu().numpy()
+                true_masks_np = true_masks[i].cpu().numpy()
                 true_presence_np = true_presence[i].cpu().numpy()
+
+                pred_masks_np = outputs['segmentation_probs'][i].cpu().numpy()
                 pred_presence_np = outputs['presence_probs'][i].cpu().numpy()
 
                 # Calculate confidence scores (entropy-based)
@@ -167,54 +175,24 @@ class MemoryOptimizedModelEvaluator:
                 confidence = 1.0 - (-presence_probs * np.log(presence_probs + 1e-8) -
                                     (1 - presence_probs) * np.log(1 - presence_probs + 1e-8))
 
-                # Store presence detection results (these are small)
+                self.results['images'].append(image_np)
+                self.results['segmentation_targets'].append(true_masks_np)
                 self.results['presence_targets'].append(true_presence_np)
+                self.results['segmentation_predictions'].append(pred_masks_np)
                 self.results['presence_predictions'].append(pred_presence_np)
                 self.results['scenarios'].append(scenarios[i])
                 self.results['sample_indices'].append(indices[i].item())
                 self.results['confidence_scores'].append(confidence)
 
-                # Process segmentation metrics immediately (don't store large arrays)
-                true_masks_np = true_masks[i].cpu().numpy()
-                pred_masks_np = outputs['segmentation_probs'][i].cpu().numpy()
-                pred_masks_binary = (pred_masks_np > 0.5).astype(float)
-
-                for j, struct_name in enumerate(self.structure_names):
-                    # Only calculate for samples where structure is present
-                    if true_presence_np[j] == 1:
-                        true_mask = true_masks_np[j]
-                        pred_mask = pred_masks_binary[j]
-
-                        dice = self.dice_coefficient(pred_mask, true_mask)
-                        iou = self.iou_score(pred_mask, true_mask)
-
-                        self.segmentation_metrics[struct_name]['dice_scores'].append(float(dice))
-                        self.segmentation_metrics[struct_name]['iou_scores'].append(float(iou))
-                        self.segmentation_metrics[struct_name]['num_samples'] += 1
-
-                # Store limited samples for visualization
-                if len(self.sample_visualizations) < self.max_vis_samples:
-                    sample_vis = {
-                        'image': images[i][0].cpu().numpy(),  # Remove channel dim
-                        'scenario': scenarios[i],
-                        'presence_true': true_presence_np,
-                        'presence_pred': pred_presence_np,
-                        'confidence': confidence,
-                        'index': indices[i].item()
-                    }
-                    self.sample_visualizations.append(sample_vis)
-
-            # Clear GPU memory
-            del images, true_masks, true_presence, outputs
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
     def calculate_metrics(self):
         """Calculate comprehensive evaluation metrics"""
         print("Calculating evaluation metrics...")
 
-        # Convert to arrays (only small presence detection data)
+        # Convert to arrays
         presence_targets = np.array(self.results['presence_targets'])  # [N, C]
         presence_predictions = np.array(self.results['presence_predictions'])  # [N, C]
+        segmentation_targets = np.array(self.results['segmentation_targets'])  # [N, C, H, W, D]
+        segmentation_predictions = np.array(self.results['segmentation_predictions'])  # [N, C, H, W, D]
         scenarios = self.results['scenarios']
         confidence_scores = np.array(self.results['confidence_scores'])  # [N, C]
 
@@ -274,20 +252,35 @@ class MemoryOptimizedModelEvaluator:
 
         # ============ SEGMENTATION METRICS ============
         print("  Computing segmentation metrics...")
+        segmentation_pred_binary = (segmentation_predictions > 0.5).astype(float)
 
         segmentation_metrics = {}
-        for struct_name in self.structure_names:
-            dice_scores = self.segmentation_metrics[struct_name]['dice_scores']
-            iou_scores = self.segmentation_metrics[struct_name]['iou_scores']
-            num_samples = self.segmentation_metrics[struct_name]['num_samples']
+        for i, struct_name in enumerate(self.structure_names):
+            dice_scores = []
+            iou_scores = []
 
-            if dice_scores:
+            # Only calculate for samples where structure is present
+            present_mask = presence_targets[:, i] == 1
+            n_present = present_mask.sum()
+
+            if n_present > 0:
+                for j in range(len(segmentation_targets)):
+                    if presence_targets[j, i] == 1:
+                        true_mask = segmentation_targets[j, i]
+                        pred_mask = segmentation_pred_binary[j, i]
+
+                        dice = self.dice_coefficient(pred_mask, true_mask)
+                        iou = self.iou_score(pred_mask, true_mask)
+
+                        dice_scores.append(dice)
+                        iou_scores.append(iou)
+
                 segmentation_metrics[struct_name] = {
-                    'mean_dice': float(np.mean(dice_scores)),
-                    'std_dice': float(np.std(dice_scores)),
-                    'mean_iou': float(np.mean(iou_scores)),
-                    'std_iou': float(np.std(iou_scores)),
-                    'num_samples': num_samples
+                    'mean_dice': float(np.mean(dice_scores)) if dice_scores else 0.0,
+                    'std_dice': float(np.std(dice_scores)) if dice_scores else 0.0,
+                    'mean_iou': float(np.mean(iou_scores)) if iou_scores else 0.0,
+                    'std_iou': float(np.std(iou_scores)) if iou_scores else 0.0,
+                    'num_samples': len(dice_scores)
                 }
             else:
                 segmentation_metrics[struct_name] = {
@@ -372,7 +365,7 @@ class MemoryOptimizedModelEvaluator:
 
         # ============ SAMPLE VISUALIZATIONS ============
         print("  Creating sample visualizations...")
-        self.visualize_samples(min(max_samples, len(self.sample_visualizations)))
+        self.visualize_samples(max_samples)
 
         # ============ PRESENCE DETECTION VISUALIZATIONS ============
         print("  Creating presence detection visualizations...")
@@ -400,12 +393,9 @@ class MemoryOptimizedModelEvaluator:
 
         print("  Visualizations completed!")
 
-        # Force garbage collection
-        gc.collect()
-
     def visualize_samples(self, max_samples=50):
         """Visualize individual test samples with predictions"""
-        n_samples = min(max_samples, len(self.sample_visualizations))
+        n_samples = min(max_samples, len(self.results['images']))
         samples_per_figure = 6
         n_figures = (n_samples + samples_per_figure - 1) // samples_per_figure
 
@@ -420,14 +410,12 @@ class MemoryOptimizedModelEvaluator:
 
             for sample_idx in range(current_samples):
                 idx = start_idx + sample_idx
-                sample = self.sample_visualizations[idx]
 
                 # Get sample data
-                image = sample['image']
-                scenario = sample['scenario']
-                presence_true = sample['presence_true']
-                presence_pred = sample['presence_pred']
-                confidence = sample['confidence']
+                image = self.results['images'][idx][0]  # Remove channel dim
+                scenario = self.results['scenarios'][idx]
+                presence_true = self.results['presence_targets'][idx]
+                presence_pred = self.results['presence_predictions'][idx]
 
                 # Get middle slice
                 middle_slice = image.shape[-1] // 2
@@ -441,6 +429,7 @@ class MemoryOptimizedModelEvaluator:
 
                 # True presence labels
                 present_true = [self.structure_names[i] for i, p in enumerate(presence_true) if p == 1]
+                absent_true = [self.structure_names[i] for i, p in enumerate(presence_true) if p == 0]
 
                 text_true = f"Present ({len(present_true)}):\n"
                 text_true += "\n".join(present_true[:8])  # Limit to first 8
@@ -469,13 +458,14 @@ class MemoryOptimizedModelEvaluator:
                 axes[sample_idx, 2].axis('off')
 
                 # Prediction confidence heatmap
+                conf_scores = self.results['confidence_scores'][idx]
                 correct_predictions = (presence_pred_binary == presence_true).astype(float)
 
                 # Create a simple heatmap showing confidence and correctness
                 y_pos = np.arange(len(self.structure_names))
                 colors = ['red' if c == 0 else 'green' for c in correct_predictions]
 
-                bars = axes[sample_idx, 3].barh(y_pos, confidence, color=colors, alpha=0.7)
+                bars = axes[sample_idx, 3].barh(y_pos, conf_scores, color=colors, alpha=0.7)
                 axes[sample_idx, 3].set_yticks(y_pos)
                 axes[sample_idx, 3].set_yticklabels([name[:8] for name in self.structure_names], fontsize=6)
                 axes[sample_idx, 3].set_xlabel('Confidence')
@@ -894,7 +884,7 @@ class MemoryOptimizedModelEvaluator:
         report_lines.append("")
 
         # Overall statistics
-        report_lines.append(f"Total test samples: {len(self.sample_visualizations)}")
+        report_lines.append(f"Total test samples: {len(self.results['images'])}")
         report_lines.append(f"Number of anatomical structures: {len(self.structure_names)}")
         report_lines.append(f"Overall presence detection accuracy: {metrics['presence_overall_accuracy']:.4f}")
         report_lines.append(f"Overall mean Dice score: {metrics['segmentation_overall']['mean_dice']:.4f}")
@@ -957,7 +947,7 @@ class MemoryOptimizedModelEvaluator:
         with open(self.output_dir / 'evaluation_report.txt', 'w') as f:
             f.write('\n'.join(report_lines))
 
-        # Save predictions for further analysis (only presence detection - segmentation too large)
+        # Save predictions for further analysis
         predictions_data = {
             'sample_indices': self.results['sample_indices'],
             'scenarios': self.results['scenarios'],
@@ -1014,7 +1004,7 @@ def load_model_from_checkpoint(checkpoint_path, structure_names, image_size, dev
 
 def main():
     """Main testing function"""
-    parser = argparse.ArgumentParser(description='Memory-Optimized Medical Model Testing')
+    parser = argparse.ArgumentParser(description='Comprehensive Medical Model Testing')
 
     parser.add_argument('--weights', '-w', type=str, required=True,
                         help='Path to model weights (.pth file)')
@@ -1026,7 +1016,7 @@ def main():
                         help='Dataset split to evaluate on')
     parser.add_argument('--output', '-o', type=str, default='./test_results',
                         help='Output directory for results')
-    parser.add_argument('--batch-size', '-b', type=int, default=2,  # Reduced default batch size
+    parser.add_argument('--batch-size', '-b', type=int, default=4,
                         help='Batch size for evaluation')
     parser.add_argument('--max-samples', '-m', type=int, default=50,
                         help='Maximum number of samples to visualize individually')
@@ -1055,7 +1045,7 @@ def main():
         raise FileNotFoundError(f"Dataset directory not found: {args.dataset}")
 
     print("=" * 80)
-    print("MEMORY-OPTIMIZED MEDICAL MODEL TESTING")
+    print("COMPREHENSIVE MEDICAL MODEL TESTING")
     print("=" * 80)
     print(f"Weights file: {args.weights}")
     print(f"Dataset: {args.dataset}")
@@ -1109,30 +1099,26 @@ def main():
         return
 
     # Create evaluator
-    print(f"\nInitializing memory-optimized evaluator...")
-    evaluator = MemoryOptimizedModelEvaluator(model, device, structure_names, args.output)
+    print(f"\nInitializing evaluator...")
+    evaluator = ModelEvaluator(model, device, structure_names, args.output)
 
     # Run evaluation
     print(f"\nRunning evaluation on {len(dataset)} samples...")
-    print("Memory-optimized processing - segmentation metrics calculated on-the-fly...")
+    print("This may take a while depending on dataset size and hardware...")
 
     try:
         # Process all batches
         for batch_idx, batch in enumerate(tqdm(data_loader, desc="Evaluating")):
             evaluator.evaluate_batch(batch)
 
-            # Periodic garbage collection to free memory
-            if batch_idx % 50 == 0:
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            # Optional: limit evaluation for testing
+            # if batch_idx >= 10:  # Uncomment to limit evaluation
+            #     break
 
-        print(f"\nEvaluation completed! Processed {len(evaluator.results['presence_predictions'])} samples")
+        print(f"\nEvaluation completed! Processed {len(evaluator.results['images'])} samples")
 
     except Exception as e:
         print(f"Error during evaluation: {e}")
-        import traceback
-        traceback.print_exc()
         return
 
     # Calculate metrics
@@ -1142,8 +1128,6 @@ def main():
         print("  Metrics calculation completed!")
     except Exception as e:
         print(f"Error calculating metrics: {e}")
-        import traceback
-        traceback.print_exc()
         return
 
     # Create visualizations
@@ -1153,8 +1137,6 @@ def main():
         print("  Visualizations completed!")
     except Exception as e:
         print(f"Error creating visualizations: {e}")
-        import traceback
-        traceback.print_exc()
         return
 
     # Save detailed results
