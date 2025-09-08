@@ -925,7 +925,17 @@ def load_model_from_checkpoint(checkpoint_path, structure_names, image_size, dev
     """Load model from checkpoint"""
     print(f"Loading model from {checkpoint_path}...")
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # Load checkpoint with weights_only=False for compatibility with older checkpoints
+    # This is safe if you trust the source of your checkpoint files
+    try:
+        # Try loading with weights_only=True first (more secure)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    except Exception as e:
+        print(f"  Secure loading failed, trying compatibility mode...")
+        print(f"  Error: {str(e)[:100]}...")
+        # Fall back to weights_only=False for compatibility
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        print(f"  Loaded successfully with compatibility mode")
 
     # Create model
     model = SpatialAttentionMedicalSegmenter(
@@ -945,7 +955,7 @@ def load_model_from_checkpoint(checkpoint_path, structure_names, image_size, dev
 
 
 def main():
-    """Main test function"""
+    """Main testing function"""
     parser = argparse.ArgumentParser(description='Comprehensive Medical Model Testing')
 
     parser.add_argument('--weights', '-w', type=str, required=True,
@@ -1053,7 +1063,7 @@ def main():
         for batch_idx, batch in enumerate(tqdm(data_loader, desc="Evaluating")):
             evaluator.evaluate_batch(batch)
 
-            # Optional: limit evaluation for test
+            # Optional: limit evaluation for testing
             # if batch_idx >= 10:  # Uncomment to limit evaluation
             #     break
 
