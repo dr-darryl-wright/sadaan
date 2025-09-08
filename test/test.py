@@ -645,6 +645,7 @@ class ModelEvaluator:
         calibration_data = metrics['calibration_data']
 
         if not calibration_data:
+            print("    No calibration data available, skipping confidence analysis")
             return
 
         # Convert to DataFrame for easier plotting
@@ -654,71 +655,118 @@ class ModelEvaluator:
         fig, axes = plt.subplots(2, 2, figsize=(15, 12))
 
         # Calibration curve
-        avg_conf_by_bin = df.groupby('bin_start')['confidence'].mean()
-        avg_acc_by_bin = df.groupby('bin_start')['accuracy'].mean()
+        try:
+            avg_conf_by_bin = df.groupby('bin_start')['confidence'].mean()
+            avg_acc_by_bin = df.groupby('bin_start')['accuracy'].mean()
 
-        axes[0, 0].plot([0, 1], [0, 1], 'k--', alpha=0.5, label='Perfect calibration')
-        axes[0, 0].plot(avg_conf_by_bin.values, avg_acc_by_bin.values, 'o-',
-                        color='red', label='Model calibration')
-        axes[0, 0].set_xlabel('Mean Predicted Probability')
-        axes[0, 0].set_ylabel('Fraction of Positives')
-        axes[0, 0].set_title('Reliability Diagram (Calibration Curve)')
-        axes[0, 0].legend()
-        axes[0, 0].set_xlim(0, 1)
-        axes[0, 0].set_ylim(0, 1)
+            # Ensure we have valid data
+            if len(avg_conf_by_bin) > 0 and len(avg_acc_by_bin) > 0:
+                axes[0, 0].plot([0, 1], [0, 1], 'k--', alpha=0.5, label='Perfect calibration')
+                axes[0, 0].plot(avg_conf_by_bin.values, avg_acc_by_bin.values, 'o-',
+                                color='red', label='Model calibration')
+                axes[0, 0].set_xlabel('Mean Predicted Probability')
+                axes[0, 0].set_ylabel('Fraction of Positives')
+                axes[0, 0].set_title('Reliability Diagram (Calibration Curve)')
+                axes[0, 0].legend()
+                axes[0, 0].set_xlim(0, 1)
+                axes[0, 0].set_ylim(0, 1)
+            else:
+                axes[0, 0].text(0.5, 0.5, 'No calibration data available',
+                                ha='center', va='center', transform=axes[0, 0].transAxes)
+                axes[0, 0].set_title('Reliability Diagram (Calibration Curve)')
+        except Exception as e:
+            print(f"    Warning: Could not create calibration curve: {e}")
+            axes[0, 0].text(0.5, 0.5, 'Error creating calibration curve',
+                            ha='center', va='center', transform=axes[0, 0].transAxes)
 
         # Confidence distribution
-        all_confidences = np.concatenate([self.results['confidence_scores']])
-        axes[0, 1].hist(all_confidences, bins=20, alpha=0.7, color='skyblue', edgecolor='black')
-        axes[0, 1].set_xlabel('Confidence Score')
-        axes[0, 1].set_ylabel('Frequency')
-        axes[0, 1].set_title('Distribution of Confidence Scores')
+        try:
+            all_confidences = []
+            for conf_array in self.results['confidence_scores']:
+                if isinstance(conf_array, np.ndarray):
+                    all_confidences.extend(conf_array.flatten())
+                else:
+                    all_confidences.extend(np.array(conf_array).flatten())
+
+            if len(all_confidences) > 0:
+                axes[0, 1].hist(all_confidences, bins=20, alpha=0.7, color='skyblue', edgecolor='black')
+                axes[0, 1].set_xlabel('Confidence Score')
+                axes[0, 1].set_ylabel('Frequency')
+                axes[0, 1].set_title('Distribution of Confidence Scores')
+            else:
+                axes[0, 1].text(0.5, 0.5, 'No confidence data available',
+                                ha='center', va='center', transform=axes[0, 1].transAxes)
+        except Exception as e:
+            print(f"    Warning: Could not create confidence distribution: {e}")
+            axes[0, 1].text(0.5, 0.5, 'Error creating confidence distribution',
+                            ha='center', va='center', transform=axes[0, 1].transAxes)
 
         # Per-structure confidence vs accuracy
-        structure_conf_acc = {}
-        for struct in self.structure_names:
-            struct_data = df[df['structure'] == struct]
-            if not struct_data.empty:
-                structure_conf_acc[struct] = {
-                    'confidence': struct_data['confidence'].mean(),
-                    'accuracy': struct_data['accuracy'].mean()
-                }
+        try:
+            structure_conf_acc = {}
+            for struct in self.structure_names:
+                struct_data = df[df['structure'] == struct]
+                if not struct_data.empty:
+                    structure_conf_acc[struct] = {
+                        'confidence': struct_data['confidence'].mean(),
+                        'accuracy': struct_data['accuracy'].mean()
+                    }
 
-        if structure_conf_acc:
-            conf_vals = [structure_conf_acc[s]['confidence'] for s in structure_conf_acc.keys()]
-            acc_vals = [structure_conf_acc[s]['accuracy'] for s in structure_conf_acc.keys()]
+            if structure_conf_acc:
+                conf_vals = [structure_conf_acc[s]['confidence'] for s in structure_conf_acc.keys()]
+                acc_vals = [structure_conf_acc[s]['accuracy'] for s in structure_conf_acc.keys()]
 
-            axes[1, 0].scatter(conf_vals, acc_vals, s=100, alpha=0.7, c='orange')
-            for i, struct in enumerate(structure_conf_acc.keys()):
-                axes[1, 0].annotate(struct[:8], (conf_vals[i], acc_vals[i]),
-                                    xytext=(5, 5), textcoords='offset points', fontsize=8)
-            axes[1, 0].set_xlabel('Average Confidence')
-            axes[1, 0].set_ylabel('Average Accuracy')
-            axes[1, 0].set_title('Confidence vs Accuracy by Structure')
-            axes[1, 0].plot([0, 1], [0, 1], 'k--', alpha=0.5)
+                axes[1, 0].scatter(conf_vals, acc_vals, s=100, alpha=0.7, c='orange')
+                for i, struct in enumerate(structure_conf_acc.keys()):
+                    if i < len(conf_vals) and i < len(acc_vals):
+                        axes[1, 0].annotate(struct[:8], (conf_vals[i], acc_vals[i]),
+                                            xytext=(5, 5), textcoords='offset points', fontsize=8)
+                axes[1, 0].set_xlabel('Average Confidence')
+                axes[1, 0].set_ylabel('Average Accuracy')
+                axes[1, 0].set_title('Confidence vs Accuracy by Structure')
+                axes[1, 0].plot([0, 1], [0, 1], 'k--', alpha=0.5)
+            else:
+                axes[1, 0].text(0.5, 0.5, 'No per-structure data available',
+                                ha='center', va='center', transform=axes[1, 0].transAxes)
+        except Exception as e:
+            print(f"    Warning: Could not create confidence vs accuracy plot: {e}")
+            axes[1, 0].text(0.5, 0.5, 'Error creating confidence vs accuracy plot',
+                            ha='center', va='center', transform=axes[1, 0].transAxes)
 
         # Calibration error by structure
-        ece_by_structure = {}  # Expected Calibration Error
-        for struct in self.structure_names:
-            struct_data = df[df['structure'] == struct]
-            if not struct_data.empty:
-                ece = 0
-                total_samples = struct_data['count'].sum()
-                for _, row in struct_data.iterrows():
-                    bin_weight = row['count'] / total_samples
-                    ece += bin_weight * abs(row['confidence'] - row['accuracy'])
-                ece_by_structure[struct] = ece
+        try:
+            ece_by_structure = {}  # Expected Calibration Error
+            for struct in self.structure_names:
+                struct_data = df[df['structure'] == struct]
+                if not struct_data.empty and struct_data['count'].sum() > 0:
+                    ece = 0
+                    total_samples = struct_data['count'].sum()
+                    for _, row in struct_data.iterrows():
+                        if total_samples > 0:
+                            bin_weight = row['count'] / total_samples
+                            ece += bin_weight * abs(row['confidence'] - row['accuracy'])
+                    ece_by_structure[struct] = ece
 
-        if ece_by_structure:
-            structures = list(ece_by_structure.keys())
-            ece_values = list(ece_by_structure.values())
+            if ece_by_structure:
+                structures = list(ece_by_structure.keys())
+                ece_values = list(ece_by_structure.values())
 
-            bars = axes[1, 1].bar(range(len(structures)), ece_values, color='lightcoral')
-            axes[1, 1].set_title('Expected Calibration Error by Structure')
-            axes[1, 1].set_xlabel('Anatomical Structures')
-            axes[1, 1].set_ylabel('Expected Calibration Error')
-            axes[1, 1].set_xticks(range(len(structures)))
-            axes[1, 1].set_xticklabels([s[:8] for s in structures], rotation=45, ha='right')
+                # Create colors list with proper length
+                colors = plt.cm.Set3(np.linspace(0, 1, len(structures)))
+
+                bars = axes[1, 1].bar(range(len(structures)), ece_values, color=colors)
+                axes[1, 1].set_title('Expected Calibration Error by Structure')
+                axes[1, 1].set_xlabel('Anatomical Structures')
+                axes[1, 1].set_ylabel('Expected Calibration Error')
+                axes[1, 1].set_xticks(range(len(structures)))
+                axes[1, 1].set_xticklabels([s[:8] for s in structures], rotation=45, ha='right')
+            else:
+                axes[1, 1].text(0.5, 0.5, 'No calibration error data available',
+                                ha='center', va='center', transform=axes[1, 1].transAxes)
+        except Exception as e:
+            print(f"    Warning: Could not create calibration error plot: {e}")
+            axes[1, 1].text(0.5, 0.5, 'Error creating calibration error plot',
+                            ha='center', va='center', transform=axes[1, 1].transAxes)
 
         plt.tight_layout()
         plt.savefig(self.output_dir / 'confidence_analysis.png', dpi=150, bbox_inches='tight')
