@@ -21,7 +21,7 @@ class StructureTemplate:
 
 
 class SyntheticAnatomyGenerator:
-    """Generate synthetic anatomical data for testing medical AI models"""
+    """Generate synthetic anatomical data for test medical AI models"""
 
     def __init__(self, image_size: Tuple[int, int, int] = (128, 128, 64)):
         self.image_size = image_size
@@ -855,7 +855,7 @@ def example_training_loop():
         print(f"  Validation: {val_total} samples processed")
 
 
-# Example usage and testing
+# Example usage and test
 if __name__ == "__main__":
     # Create dataset generator
     generator = SyntheticDatasetGenerator(image_size=(128, 128, 64))
