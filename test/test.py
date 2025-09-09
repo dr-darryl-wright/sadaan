@@ -1,6 +1,4 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
@@ -8,14 +6,12 @@ import seaborn as sns
 from pathlib import Path
 import json
 import argparse
-from typing import Dict, List, Tuple, Optional, Any
 import pandas as pd
-from collections import defaultdict, Counter
+from collections import defaultdict
 from sklearn.metrics import (
     classification_report, confusion_matrix, roc_auc_score,
     precision_recall_curve, roc_curve, average_precision_score
 )
-from sklearn.preprocessing import label_binarize
 import h5py
 from tqdm import tqdm
 import warnings
