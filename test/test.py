@@ -28,53 +28,41 @@ from sadaan import SpatialAttentionMedicalSegmenter, SpatialAttentionLoss
 
 
 class HDF5MedicalDataset(torch.utils.data.Dataset):
-    """Memory-efficient HDF5 dataset with optional SWMR (multi-worker) support.
-
-    Notes:
-      - Opens the HDF5 file per-sample inside __getitem__ to avoid keeping large objects in RAM.
-      - Detects SWMR support at init and will attempt to open files with swmr=True when available.
-      - Preserves attributes like 'structure_names' and 'image_size' when present in the HDF5 file.
-    """
     def __init__(self, hdf5_path, split='test', indices=None, transform=None):
         self.hdf5_path = str(hdf5_path)
         self.split = split
         self.transform = transform
         self.indices = indices
 
-        # detect available SWMR support in h5py and try to enable it later when reading
         self._swmr_supported = getattr(h5py.get_config(), "swmr_support", False)
         self.use_swmr = False
 
-        # Read lightweight metadata once
         with h5py.File(self.hdf5_path, "r") as f:
-            # support dataset layout like f['images'] or grouped by split f[split]['images']
             if self.split in f and 'images' in f[self.split]:
                 root = f[self.split]
-            elif 'images' in f:
-                root = f
             else:
-                raise KeyError("Could not find 'images' dataset in the HDF5 file for split '%s'." % self.split)
-
+                root = f
             self.n_samples = len(root['images'])
-            # try to read optional metadata attributes
             self.structure_names = list(f.attrs.get('structure_names', [])) if 'structure_names' in f.attrs else None
             self.image_size = tuple(f.attrs.get('image_size')) if 'image_size' in f.attrs else None
 
         if self.indices is None:
             self.indices = list(range(self.n_samples))
 
-        # Test whether opening in SWMR mode works (if supported by h5py and file)
         if self._swmr_supported:
             try:
-                with h5py.File(self.hdf5_path, "r", swmr=True, libver='latest') as f:
-                    _ = f[root['images'].name][0]  # tiny read to validate
+                with h5py.File(self.hdf5_path, "r", swmr=True, libver="latest") as f:
+                    if self.split in f and 'images' in f[self.split]:
+                        _ = f[self.split]['images'][0]
+                    else:
+                        _ = f['images'][0]
                 self.use_swmr = True
-                print(f'[HDF5MedicalDataset] SWMR supported and enabled for {self.hdf5_path}')
-            except Exception:
+                print(f"[HDF5MedicalDataset] Using SWMR mode for {self.hdf5_path}")
+            except (OSError, ValueError, IOError):
                 self.use_swmr = False
-                print(f'[HDF5MedicalDataset] SWMR not usable for {self.hdf5_path}; using single-reader mode')
+                print(f"[HDF5MedicalDataset] SWMR not usable, falling back to normal read mode")
         else:
-            print('[HDF5MedicalDataset] h5py built without SWMR support; using single-reader mode')
+            print("[HDF5MedicalDataset] h5py not built with SWMR support; using normal read mode")
 
     def __len__(self):
         return len(self.indices)
