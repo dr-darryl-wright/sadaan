@@ -28,78 +28,103 @@ from sadaan import SpatialAttentionMedicalSegmenter, SpatialAttentionLoss
 
 
 # Import dataset classes from the generation script
-class HDF5MedicalDataset(torch.utils.data.Dataset):
-    """PyTorch Dataset that loads samples on-demand from HDF5"""
 
-    def __init__(self, data_path: str, split: str = 'test', transform=None):
-        """
-        Args:
-            data_path: Path to the HDF5 dataset directory
-            split: Dataset split ('train', 'val', 'test')
-            transform: Optional transform function
-        """
-        self.data_path = Path(data_path)
+class HDF5MedicalDataset(torch.utils.data.Dataset):
+    \"\"\"Memory-efficient HDF5 dataset with optional SWMR (multi-worker) support.
+
+    Notes:
+      - Opens the HDF5 file per-sample inside __getitem__ to avoid keeping large objects in RAM.
+      - Detects SWMR support at init and will attempt to open files with swmr=True when available.
+      - Preserves attributes like 'structure_names' and 'image_size' when present in the HDF5 file.
+    \"\"\"
+    def __init__(self, hdf5_path, split='test', indices=None, transform=None):
+        self.hdf5_path = str(hdf5_path)
         self.split = split
         self.transform = transform
+        self.indices = indices
 
-        # Load metadata
-        with open(self.data_path / 'metadata.json', 'r') as f:
-            self.metadata = json.load(f)
+        # detect available SWMR support in h5py and try to enable it later when reading
+        self._swmr_supported = getattr(h5py.get_config(), "swmr_support", False)
+        self.use_swmr = False
 
-        self.structure_names = self.metadata['structure_names']
-        self.image_size = self.metadata['image_size']
+        # Read lightweight metadata once
+        with h5py.File(self.hdf5_path, "r") as f:
+            # support dataset layout like f['images'] or grouped by split f[split]['images']
+            if self.split in f and 'images' in f[self.split]:
+                root = f[self.split]
+            elif 'images' in f:
+                root = f
+            else:
+                raise KeyError("Could not find 'images' dataset in the HDF5 file for split '%s'." % self.split)
 
-        # Open HDF5 file
-        self.hdf5_path = self.data_path / f'{self.split}.h5'
-        if not self.hdf5_path.exists():
-            raise FileNotFoundError(f"HDF5 file not found: {self.hdf5_path}")
+            self.n_samples = len(root['images'])
+            # try to read optional metadata attributes
+            self.structure_names = list(f.attrs.get('structure_names', [])) if 'structure_names' in f.attrs else None
+            self.image_size = tuple(f.attrs.get('image_size')) if 'image_size' in f.attrs else None
 
-        # Open file and get basic info
-        self.hdf5_file = h5py.File(self.hdf5_path, 'r')
-        self.n_samples = self.hdf5_file.attrs['n_samples']
+        if self.indices is None:
+            self.indices = list(range(self.n_samples))
 
-        # Preload scenarios for faster access
-        self.scenarios = [s.decode('utf-8') if isinstance(s, bytes) else s
-                          for s in self.hdf5_file['scenarios'][:]]
+        # Test whether opening in SWMR mode works (if supported by h5py and file)
+        if self._swmr_supported:
+            try:
+                with h5py.File(self.hdf5_path, "r", swmr=True, libver='latest') as f:
+                    _ = f[root['images'].name][0]  # tiny read to validate
+                self.use_swmr = True
+                print(f'[HDF5MedicalDataset] SWMR supported and enabled for {self.hdf5_path}')
+            except Exception:
+                self.use_swmr = False
+                print(f'[HDF5MedicalDataset] SWMR not usable for {self.hdf5_path}; using single-reader mode')
+        else:
+            print('[HDF5MedicalDataset] h5py built without SWMR support; using single-reader mode')
 
     def __len__(self):
-        return self.n_samples
+        return len(self.indices)
 
     def __getitem__(self, idx):
-        if idx >= self.n_samples:
-            raise IndexError(f"Index {idx} out of range for dataset of size {self.n_samples}")
+        real_idx = self.indices[idx]
 
-        # Load image and labels
-        image = self.hdf5_file['images'][idx]
-        masks = self.hdf5_file['masks'][idx]
-        presence_labels = self.hdf5_file['presence_labels'][idx]
-        scenario = self.scenarios[idx]
+        open_kwargs = {'mode': 'r'}
+        if self.use_swmr:
+            open_kwargs.update({'swmr': True, 'libver': 'latest'})
 
-        # Apply transforms if specified
-        if self.transform:
+        # Open file for each access to avoid sharing file handles across processes
+        with h5py.File(self.hdf5_path, **open_kwargs) as f:
+            if self.split in f and 'images' in f[self.split]:
+                root = f[self.split]
+            else:
+                root = f
+            # Read minimal slices. Use np.array to ensure dtype and avoid unexpected memory views.
+            image = np.array(root['images'][real_idx], dtype=np.float32)
+            masks = np.array(root['masks'][real_idx], dtype=np.float32)
+            presence = np.array(root['presence_labels'][real_idx])
+            # scenarios might be bytes or str
+            scenario = root['scenarios'][real_idx]
+            if isinstance(scenario, bytes):
+                try:
+                    scenario = scenario.decode('utf-8')
+                except Exception:
+                    scenario = str(scenario)
+
+        # Convert to tensors
+        image = torch.from_numpy(image).float()
+        masks = torch.from_numpy(masks).float()
+        presence = torch.from_numpy(presence).long()
+
+        # Ensure channel dimension for image
+        if image.ndim == 2:
+            image = image.unsqueeze(0)
+
+        if self.transform is not None:
             image = self.transform(image)
-
-        # Convert to torch tensors
-        image = torch.from_numpy(image.astype(np.float32))
-        masks = torch.from_numpy(masks.astype(np.float32))
-        presence_labels = torch.from_numpy(presence_labels.astype(np.int64))
-
-        # Add channel dimension to image
-        image = image.unsqueeze(0)  # [1, H, W, D]
 
         return {
             'image': image,
             'masks': masks,
-            'presence_labels': presence_labels,
+            'presence_labels': presence,
             'scenario': scenario,
-            'index': idx
+            'index': real_idx
         }
-
-    def __del__(self):
-        """Clean up HDF5 file handle"""
-        if hasattr(self, 'hdf5_file'):
-            self.hdf5_file.close()
-
 
 class ModelEvaluator:
     """Comprehensive model evaluation with visualizations"""
