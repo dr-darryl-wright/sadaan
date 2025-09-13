@@ -27,8 +27,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'model'))
 from sadaan import SpatialAttentionMedicalSegmenter, SpatialAttentionLoss
 
 
-# Import dataset classes from the generation script
-
 class HDF5MedicalDataset(torch.utils.data.Dataset):
     \"\"\"Memory-efficient HDF5 dataset with optional SWMR (multi-worker) support.
 
