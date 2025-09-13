@@ -28,13 +28,13 @@ from sadaan import SpatialAttentionMedicalSegmenter, SpatialAttentionLoss
 
 
 class HDF5MedicalDataset(torch.utils.data.Dataset):
-    \"\"\"Memory-efficient HDF5 dataset with optional SWMR (multi-worker) support.
+    """Memory-efficient HDF5 dataset with optional SWMR (multi-worker) support.
 
     Notes:
       - Opens the HDF5 file per-sample inside __getitem__ to avoid keeping large objects in RAM.
       - Detects SWMR support at init and will attempt to open files with swmr=True when available.
       - Preserves attributes like 'structure_names' and 'image_size' when present in the HDF5 file.
-    \"\"\"
+    """
     def __init__(self, hdf5_path, split='test', indices=None, transform=None):
         self.hdf5_path = str(hdf5_path)
         self.split = split
@@ -486,8 +486,9 @@ class ModelEvaluator:
         self.visualize_roc_pr_curves(metrics)
 
         # ============ FEATURE RESPONSE ANALYSIS ============
-        print("  Creating feature response analysis...")
-        self.visualize_feature_responses()
+        # TODO: This is buggy and skipping for now.
+        #print("  Creating feature response analysis...")
+        #self.visualize_feature_responses()
 
         print("  Visualizations completed!")
 
@@ -813,6 +814,8 @@ class ModelEvaluator:
 
         # 3. Response correlation between structures
         response_correlations = np.corrcoef(mean_responses)
+        print(response_correlations.shape)
+        print(response_correlations)
         im = axes[0, 2].imshow(response_correlations, cmap='coolwarm', vmin=-1, vmax=1)
         axes[0, 2].set_title('Inter-Structure Response Correlations')
         axes[0, 2].set_xticks(range(len(self.structure_names)))
