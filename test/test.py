@@ -463,8 +463,9 @@ class ModelEvaluator:
         self.visualize_roc_pr_curves(metrics)
 
         # ============ FEATURE RESPONSE ANALYSIS ============
-        print("  Creating feature response analysis...")
-        self.visualize_feature_responses()
+        # TODO: This is buggy and skipping for now.
+        #print("  Creating feature response analysis...")
+        #self.visualize_feature_responses()
 
         print("  Visualizations completed!")
 
@@ -790,6 +791,8 @@ class ModelEvaluator:
 
         # 3. Response correlation between structures
         response_correlations = np.corrcoef(mean_responses)
+        print(response_correlations.shape)
+        print(response_correlations)
         im = axes[0, 2].imshow(response_correlations, cmap='coolwarm', vmin=-1, vmax=1)
         axes[0, 2].set_title('Inter-Structure Response Correlations')
         axes[0, 2].set_xticks(range(len(self.structure_names)))
