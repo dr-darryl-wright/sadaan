@@ -29,7 +29,7 @@ from sadaan import SpatialAttentionMedicalSegmenter, SpatialAttentionLoss
 
 class HDF5MedicalDataset(torch.utils.data.Dataset):
     def __init__(self, hdf5_path, split='test', indices=None, transform=None):
-        self.hdf5_path = str(hdf5_path)
+        self.hdf5_path = str(hdf5_path) + split + '.h5'
         self.split = split
         self.transform = transform
         self.indices = indices
