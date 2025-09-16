@@ -108,12 +108,7 @@ class HDF5MedicalDataset(torch.utils.data.Dataset):
             "scenario": scenario,
             "index": real_idx
         }
-            'image': image,
-            'masks': masks,
-            'presence_labels': presence,
-            'scenario': scenario,
-            'index': real_idx
-        }
+
 
 class ModelEvaluator:
     """Comprehensive model evaluation with visualizations"""
