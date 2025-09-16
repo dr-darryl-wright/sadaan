@@ -37,6 +37,7 @@ class HDF5MedicalDataset(torch.utils.data.Dataset):
         self._swmr_supported = getattr(h5py.get_config(), "swmr_support", False)
         self.use_swmr = False
 
+        # Read metadata once
         with h5py.File(self.hdf5_path, "r") as f:
             if self.split in f and 'images' in f[self.split]:
                 root = f[self.split]
@@ -49,6 +50,7 @@ class HDF5MedicalDataset(torch.utils.data.Dataset):
         if self.indices is None:
             self.indices = list(range(self.n_samples))
 
+        # Try SWMR mode if supported
         if self._swmr_supported:
             try:
                 with h5py.File(self.hdf5_path, "r", swmr=True, libver="latest") as f:
@@ -70,34 +72,29 @@ class HDF5MedicalDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         real_idx = self.indices[idx]
 
-        open_kwargs = {'mode': 'r'}
+        open_kwargs = {"mode": "r"}
         if self.use_swmr:
-            open_kwargs.update({'swmr': True, 'libver': 'latest'})
+            open_kwargs.update({"swmr": True, "libver": "latest"})
 
-        # Open file for each access to avoid sharing file handles across processes
         with h5py.File(self.hdf5_path, **open_kwargs) as f:
             if self.split in f and 'images' in f[self.split]:
                 root = f[self.split]
             else:
                 root = f
-            # Read minimal slices. Use np.array to ensure dtype and avoid unexpected memory views.
             image = np.array(root['images'][real_idx], dtype=np.float32)
             masks = np.array(root['masks'][real_idx], dtype=np.float32)
             presence = np.array(root['presence_labels'][real_idx])
-            # scenarios might be bytes or str
             scenario = root['scenarios'][real_idx]
             if isinstance(scenario, bytes):
                 try:
-                    scenario = scenario.decode('utf-8')
+                    scenario = scenario.decode("utf-8")
                 except Exception:
                     scenario = str(scenario)
 
-        # Convert to tensors
         image = torch.from_numpy(image).float()
         masks = torch.from_numpy(masks).float()
         presence = torch.from_numpy(presence).long()
 
-        # Ensure channel dimension for image
         if image.ndim == 2:
             image = image.unsqueeze(0)
 
@@ -105,6 +102,12 @@ class HDF5MedicalDataset(torch.utils.data.Dataset):
             image = self.transform(image)
 
         return {
+            "image": image,
+            "masks": masks,
+            "presence_labels": presence,
+            "scenario": scenario,
+            "index": real_idx
+        }
             'image': image,
             'masks': masks,
             'presence_labels': presence,
@@ -474,9 +477,8 @@ class ModelEvaluator:
         self.visualize_roc_pr_curves(metrics)
 
         # ============ FEATURE RESPONSE ANALYSIS ============
-        # TODO: This is buggy and skipping for now.
-        #print("  Creating feature response analysis...")
-        #self.visualize_feature_responses()
+        print("  Creating feature response analysis...")
+        self.visualize_feature_responses()
 
         print("  Visualizations completed!")
 
@@ -802,8 +804,6 @@ class ModelEvaluator:
 
         # 3. Response correlation between structures
         response_correlations = np.corrcoef(mean_responses)
-        print(response_correlations.shape)
-        print(response_correlations)
         im = axes[0, 2].imshow(response_correlations, cmap='coolwarm', vmin=-1, vmax=1)
         axes[0, 2].set_title('Inter-Structure Response Correlations')
         axes[0, 2].set_xticks(range(len(self.structure_names)))
