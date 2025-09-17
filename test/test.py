@@ -1,4 +1,68 @@
-import torch
+def visualize_selected_samples(self):
+    """Visualize selected samples stored during evaluation - kept for compatibility"""
+    if not self.visualization_samples:
+        print("    No visualization samples available")
+        return
+
+    samples_per_figure = 6
+    n_figures = (len(self.visualization_samples) + samples_per_figure - 1) // samples_per_figure
+
+    for fig_idx in range(n_figures):
+        start_idx = fig_idx * samples_per_figure
+        end_idx = min(start_idx + samples_per_figure, len(self.visualization_samples))
+        current_samples = end_idx - start_idx
+
+        fig, axes = plt.subplots(current_samples, 3, figsize=(15, 5 * current_samples))
+        if current_samples == 1:
+            axes = axes.reshape(1, -1)
+
+        for sample_idx in range(current_samples):
+            sample = self.visualization_samples[start_idx + sample_idx]
+
+            # Original image
+            img_slice = np.rot90(sample['image_slice'], -1)
+            axes[sample_idx, 0].imshow(img_slice, cmap='gray', vmin=0, vmax=255)
+            axes[sample_idx, 0].set_title(f'Sample {sample["index"]}\nScenario: {sample["scenario"]}')
+            axes[sample_idx, 0].axis('off')
+
+            # True presence labels
+            present_true = [self.structure_names[i] for i, p in enumerate(sample['true_presence']) if p == 1]
+            text_true = f"Present ({len(present_true)}):\n"
+            text_true += "\n".join([name[:12] for name in present_true[:8]])
+            if len(present_true) > 8:
+                text_true += f"\n...and {len(present_true) - 8} more"
+
+            axes[sample_idx, 1].text(0.05, 0.95, text_true,
+                                     transform=axes[sample_idx, 1].transAxes,
+                                     fontsize=8, verticalalignment='top', color='green')
+            axes[sample_idx, 1].set_title('True Labels')
+            axes[sample_idx, 1].axis('off')
+
+            # Predicted presence labels with confidence
+            pred_binary = (sample['pred_presence'] > 0.5).astype(int)
+            present_pred = []
+            for i, p in enumerate(pred_binary):
+                if p == 1:
+                    conf = sample['confidence'][i]
+                    present_pred.append(f"{self.structure_names[i][:10]} ({conf:.2f})")
+
+            text_pred = f"Predicted ({len(present_pred)}):\n"
+            text_pred += "\n".join(present_pred[:8])
+            if len(present_pred) > 8:
+                text_pred += f"\n...and {len(present_pred) - 8} more"
+
+            axes[sample_idx, 2].text(0.05, 0.95, text_pred,
+                                     transform=axes[sample_idx, 2].transAxes,
+                                     fontsize=8, verticalalignment='top', color='blue')
+            axes[sample_idx, 2].set_title('Predictions (Confidence)')
+            axes[sample_idx, 2].axis('off')
+
+        plt.tight_layout()
+        plt.savefig(self.output_dir / f'sample_predictions_{fig_idx + 1}.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        import torch
+
+
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
@@ -203,6 +267,8 @@ class MemoryEfficientEvaluator:
             true_presence_np = true_presence[0].cpu().numpy()
 
             # Store attention stats (lightweight)
+            attention_maps_np = None
+            position_priors_np = None
             if self.n_samples_processed < 5:  # Only for first few samples
                 attention_maps_np = outputs['attention_maps'][0].cpu().numpy()
                 position_priors_np = outputs['position_priors'][0].cpu().numpy()
@@ -218,7 +284,19 @@ class MemoryEfficientEvaluator:
                     self.prior_stats[struct_name]['min'] = prior_values.min()
                     self.prior_stats[struct_name]['max'] = prior_values.max()
 
-            # Clear GPU memory
+            # Store for visualization if selected - now include attention and segmentation data
+            store_for_vis = (len(self.visualization_samples) < self.max_vis_samples and
+                             (self.n_samples_processed % max(1,
+                                                             self.n_samples_processed // self.max_vis_samples) == 0 or
+                              self.n_samples_processed < self.max_vis_samples))
+
+            if store_for_vis:
+                # Get attention maps and position priors for visualization
+                if attention_maps_np is None:  # Not already computed above
+                    attention_maps_np = outputs['attention_maps'][0].cpu().numpy()
+                    position_priors_np = outputs['position_priors'][0].cpu().numpy()
+
+            # Clear GPU memory early
             del outputs, image, true_masks, true_presence
             torch.cuda.empty_cache() if self.device.type == 'cuda' else None
 
@@ -253,22 +331,38 @@ class MemoryEfficientEvaluator:
             self.scenario_stats[scenario]['structures_present'].append(true_presence_np.sum())
             self.scenario_stats[scenario]['structures_predicted'].append(pred_presence_binary.sum())
 
-            # Store selected samples for visualization
-            if len(self.visualization_samples) < self.max_vis_samples:
-                if (self.n_samples_processed % max(1, self.n_samples_processed // self.max_vis_samples) == 0 or
-                        self.n_samples_processed < self.max_vis_samples):
-                    # Store minimal visualization data
-                    vis_sample = {
-                        'index': index,
-                        'scenario': scenario,
-                        'image_slice': sample['image'][0, :, :, sample['image'].shape[-1] // 2].numpy(),
-                        # Middle slice only
-                        'true_presence': true_presence_np.copy(),
-                        'pred_presence': pred_presence_np.copy(),
-                        'confidence': 1.0 - (-pred_presence_np * np.log(pred_presence_np + 1e-8) -
-                                             (1 - pred_presence_np) * np.log(1 - pred_presence_np + 1e-8))
-                    }
-                    self.visualization_samples.append(vis_sample)
+            if store_for_vis:
+                # Find present structures for focused visualization
+                present_structures = [(i, self.structure_names[i]) for i in range(self.n_structures)
+                                      if true_presence_np[i] == 1]
+
+                # Store comprehensive visualization data
+                vis_sample = {
+                    'index': index,
+                    'scenario': scenario,
+                    'image_slice': sample['image'][0, :, :, sample['image'].shape[-1] // 2].numpy(),
+                    # Middle axial slice
+                    'image_coronal': sample['image'][0, sample['image'].shape[1] // 2, :, :].numpy(),
+                    # Middle coronal slice
+                    'image_sagittal': sample['image'][0, :, sample['image'].shape[2] // 2, :].numpy(),
+                    # Middle sagittal slice
+                    'true_presence': true_presence_np.copy(),
+                    'pred_presence': pred_presence_np.copy(),
+                    'confidence': 1.0 - (-pred_presence_np * np.log(pred_presence_np + 1e-8) -
+                                         (1 - pred_presence_np) * np.log(1 - pred_presence_np + 1e-8)),
+                    # Store attention maps for present structures only (memory efficient)
+                    'attention_maps': {struct_name: attention_maps_np[i, :, :, sample['image'].shape[-1] // 2]
+                                       for i, struct_name in present_structures[:4]},  # Limit to top 4
+                    'position_priors': {struct_name: position_priors_np[i, :, :, sample['image'].shape[-1] // 2]
+                                        for i, struct_name in present_structures[:4]},
+                    # Store segmentation data for present structures
+                    'true_masks': {struct_name: true_masks_np[i, :, :, sample['image'].shape[-1] // 2]
+                                   for i, struct_name in present_structures[:4]},
+                    'pred_masks': {struct_name: pred_masks_np[i, :, :, sample['image'].shape[-1] // 2]
+                                   for i, struct_name in present_structures[:4]},
+                    'present_structures': present_structures[:4]  # Store for easy access
+                }
+                self.visualization_samples.append(vis_sample)
 
             self.n_samples_processed += 1
 
@@ -400,14 +494,22 @@ class MemoryEfficientEvaluator:
 
     def create_lightweight_visualizations(self, metrics):
         """Create essential visualizations with minimal memory usage"""
-        print("Creating lightweight visualizations...")
+        print("Creating comprehensive visualizations...")
 
         plt.style.use('default')
         sns.set_palette("husl")
 
-        # ============ SAMPLE VISUALIZATIONS ============
-        print("  Creating sample visualizations...")
-        self.visualize_selected_samples()
+        # ============ COMPREHENSIVE SAMPLE VISUALIZATIONS ============
+        print("  Creating comprehensive sample visualizations...")
+        self.visualize_comprehensive_samples()
+
+        # ============ ATTENTION MAPS OVERVIEW ============
+        print("  Creating attention maps overview...")
+        self.visualize_attention_overview()
+
+        # ============ SEGMENTATION COMPARISON ============
+        print("  Creating segmentation comparisons...")
+        self.visualize_segmentation_comparison()
 
         # ============ PRESENCE DETECTION VISUALIZATIONS ============
         print("  Creating presence detection visualizations...")
@@ -425,7 +527,312 @@ class MemoryEfficientEvaluator:
         print("  Creating confusion matrices...")
         self.visualize_confusion_matrices()
 
-        print("  Lightweight visualizations completed!")
+        print("  Comprehensive visualizations completed!")
+
+    def visualize_comprehensive_samples(self):
+        """Create comprehensive visualizations with attention maps and segmentation"""
+        if not self.visualization_samples:
+            print("    No visualization samples available")
+            return
+
+        # Create detailed analysis for each stored sample
+        for sample_idx, sample in enumerate(self.visualization_samples):
+            if not sample['present_structures']:  # Skip samples with no present structures
+                continue
+
+            self.create_detailed_sample_analysis(sample, sample_idx)
+
+    def create_detailed_sample_analysis(self, sample, sample_idx):
+        """Create a comprehensive single sample analysis"""
+        n_structures = len(sample['present_structures'])
+        if n_structures == 0:
+            return
+
+        # Create figure with multiple views
+        fig = plt.figure(figsize=(20, 4 * n_structures + 4))
+
+        # Title
+        fig.suptitle(f'Sample {sample["index"]}: Comprehensive Analysis\nScenario: {sample["scenario"]}',
+                     fontsize=16, y=0.98)
+
+        # Original images (first row)
+        ax1 = plt.subplot(n_structures + 1, 6, 1)
+        img_axial = np.rot90(sample['image_slice'], -1)
+        ax1.imshow(img_axial, cmap='gray', vmin=0, vmax=255)
+        ax1.set_title('Original (Axial)')
+        ax1.axis('off')
+
+        ax2 = plt.subplot(n_structures + 1, 6, 2)
+        img_coronal = np.rot90(sample['image_coronal'], -1)
+        ax2.imshow(img_coronal, cmap='gray', vmin=0, vmax=255)
+        ax2.set_title('Original (Coronal)')
+        ax2.axis('off')
+
+        ax3 = plt.subplot(n_structures + 1, 6, 3)
+        img_sagittal = np.rot90(sample['image_sagittal'], -1)
+        ax3.imshow(img_sagittal, cmap='gray', vmin=0, vmax=255)
+        ax3.set_title('Original (Sagittal)')
+        ax3.axis('off')
+
+        # Prediction summary
+        ax4 = plt.subplot(n_structures + 1, 6, 4)
+        present_true = [name for i, name in enumerate(self.structure_names)
+                        if sample['true_presence'][i] == 1]
+        pred_binary = (sample['pred_presence'] > 0.5).astype(int)
+        present_pred = [name for i, name in enumerate(self.structure_names)
+                        if pred_binary[i] == 1]
+
+        summary_text = f"TRUE PRESENT ({len(present_true)}):\n"
+        summary_text += "\n".join([name[:12] for name in present_true[:8]])
+        if len(present_true) > 8:
+            summary_text += f"\n...+{len(present_true) - 8} more"
+
+        summary_text += f"\n\nPREDICTED ({len(present_pred)}):\n"
+        summary_text += "\n".join([name[:12] for name in present_pred[:8]])
+        if len(present_pred) > 8:
+            summary_text += f"\n...+{len(present_pred) - 8} more"
+
+        ax4.text(0.05, 0.95, summary_text, transform=ax4.transAxes,
+                 fontsize=9, verticalalignment='top', fontfamily='monospace')
+        ax4.set_title('Predictions Summary')
+        ax4.axis('off')
+
+        # Overall accuracy for this sample
+        ax5 = plt.subplot(n_structures + 1, 6, 5)
+        sample_accuracy = (pred_binary == sample['true_presence']).mean()
+        acc_text = f"Sample Accuracy: {sample_accuracy:.3f}\n\n"
+        acc_text += "Confidence Scores:\n"
+        for i, (struct_idx, struct_name) in enumerate(sample['present_structures']):
+            conf = sample['confidence'][struct_idx]
+            correct = "✓" if pred_binary[struct_idx] == sample['true_presence'][struct_idx] else "✗"
+            acc_text += f"{struct_name[:10]}: {conf:.3f} {correct}\n"
+
+        ax5.text(0.05, 0.95, acc_text, transform=ax5.transAxes,
+                 fontsize=9, verticalalignment='top', fontfamily='monospace')
+        ax5.set_title('Performance Metrics')
+        ax5.axis('off')
+
+        # Placeholder for additional info
+        ax6 = plt.subplot(n_structures + 1, 6, 6)
+        ax6.axis('off')
+
+        # For each present structure, create detailed analysis
+        for struct_idx, (orig_struct_idx, struct_name) in enumerate(sample['present_structures']):
+            row = struct_idx + 2  # Start from second row
+
+            # Attention map
+            ax = plt.subplot(n_structures + 1, 6, (row - 1) * 6 + 1)
+            if struct_name in sample['attention_maps']:
+                attention = sample['attention_maps'][struct_name]
+                ax.imshow(img_axial, cmap='gray', alpha=0.6, vmin=0, vmax=255)
+                im = ax.imshow(np.rot90(attention, -1), cmap='hot', alpha=0.7, vmin=0, vmax=1)
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            ax.set_title(f'{struct_name}\nAttention Map')
+            ax.axis('off')
+
+            # Position prior
+            ax = plt.subplot(n_structures + 1, 6, (row - 1) * 6 + 2)
+            if struct_name in sample['position_priors']:
+                prior = sample['position_priors'][struct_name]
+                ax.imshow(img_axial, cmap='gray', alpha=0.6, vmin=0, vmax=255)
+                im = ax.imshow(np.rot90(prior, -1), cmap='coolwarm', alpha=0.7, vmin=-1, vmax=1)
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            ax.set_title(f'{struct_name}\nPosition Prior')
+            ax.axis('off')
+
+            # True segmentation
+            ax = plt.subplot(n_structures + 1, 6, (row - 1) * 6 + 3)
+            if struct_name in sample['true_masks']:
+                true_mask = sample['true_masks'][struct_name]
+                ax.imshow(img_axial, cmap='gray', alpha=0.7, vmin=0, vmax=255)
+                ax.imshow(np.rot90(true_mask, -1), cmap='Greens', alpha=0.6, vmin=0, vmax=1)
+            ax.set_title(f'{struct_name}\nTrue Segmentation')
+            ax.axis('off')
+
+            # Predicted segmentation
+            ax = plt.subplot(n_structures + 1, 6, (row - 1) * 6 + 4)
+            if struct_name in sample['pred_masks']:
+                pred_mask = sample['pred_masks'][struct_name]
+                ax.imshow(img_axial, cmap='gray', alpha=0.7, vmin=0, vmax=255)
+                ax.imshow(np.rot90(pred_mask, -1), cmap='Reds', alpha=0.6, vmin=0, vmax=1)
+            ax.set_title(f'{struct_name}\nPred Segmentation')
+            ax.axis('off')
+
+            # Segmentation comparison (difference map)
+            ax = plt.subplot(n_structures + 1, 6, (row - 1) * 6 + 5)
+            if struct_name in sample['true_masks'] and struct_name in sample['pred_masks']:
+                true_mask = sample['true_masks'][struct_name]
+                pred_mask = sample['pred_masks'][struct_name]
+
+                true_binary = (true_mask > 0.5).astype(int)
+                pred_binary = (pred_mask > 0.5).astype(int)
+
+                # Create difference visualization
+                diff_map = np.zeros((*true_binary.shape, 3))
+
+                # True Positives (green)
+                tp_mask = (true_binary == 1) & (pred_binary == 1)
+                diff_map[tp_mask] = [0, 1, 0]
+
+                # False Positives (red)
+                fp_mask = (true_binary == 0) & (pred_binary == 1)
+                diff_map[fp_mask] = [1, 0, 0]
+
+                # False Negatives (blue)
+                fn_mask = (true_binary == 1) & (pred_binary == 0)
+                diff_map[fn_mask] = [0, 0, 1]
+
+                ax.imshow(np.rot90(diff_map, -1))
+
+                # Calculate metrics
+                dice = self.dice_coefficient(pred_binary, true_binary)
+                iou = self.iou_score(pred_binary, true_binary)
+
+                ax.set_title(f'{struct_name}\nDice: {dice:.3f}, IoU: {iou:.3f}\n'
+                             f'TP=Green, FP=Red, FN=Blue')
+            ax.axis('off')
+
+            # Combined attention + prior visualization
+            ax = plt.subplot(n_structures + 1, 6, (row - 1) * 6 + 6)
+            if (struct_name in sample['attention_maps'] and
+                    struct_name in sample['position_priors']):
+                attention = sample['attention_maps'][struct_name]
+                prior = sample['position_priors'][struct_name]
+                combined = attention + prior
+                ax.imshow(img_axial, cmap='gray', alpha=0.6, vmin=0, vmax=255)
+                im = ax.imshow(np.rot90(combined, -1), cmap='plasma', alpha=0.7)
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            ax.set_title(f'{struct_name}\nCombined\n(Attention + Prior)')
+            ax.axis('off')
+
+        plt.tight_layout()
+        plt.savefig(self.output_dir / f'comprehensive_analysis_sample_{sample_idx + 1}.png',
+                    dpi=150, bbox_inches='tight')
+        plt.close()
+
+    def visualize_attention_overview(self):
+        """Create overview of attention patterns across samples"""
+        if not self.visualization_samples:
+            return
+
+        # Collect attention data from samples
+        structure_attention_data = defaultdict(list)
+
+        for sample in self.visualization_samples:
+            for struct_name, attention_map in sample['attention_maps'].items():
+                structure_attention_data[struct_name].append(attention_map)
+
+        if not structure_attention_data:
+            return
+
+        # Create attention overview
+        structures = list(structure_attention_data.keys())
+        n_structures = len(structures)
+        n_samples = min(5, len(list(structure_attention_data.values())[0]))  # Limit samples shown
+
+        fig, axes = plt.subplots(n_structures, n_samples, figsize=(3 * n_samples, 3 * n_structures))
+        if n_structures == 1:
+            axes = axes.reshape(1, -1)
+        if n_samples == 1:
+            axes = axes.reshape(-1, 1)
+
+        for struct_idx, struct_name in enumerate(structures):
+            attention_maps = structure_attention_data[struct_name]
+            for sample_idx in range(min(n_samples, len(attention_maps))):
+                ax = axes[struct_idx, sample_idx]
+
+                attention_map = attention_maps[sample_idx]
+                im = ax.imshow(np.rot90(attention_map, -1), cmap='hot', vmin=0, vmax=1)
+
+                if sample_idx == 0:
+                    ax.set_ylabel(struct_name, rotation=90, va='center')
+                if struct_idx == 0:
+                    ax.set_title(f'Sample {sample_idx + 1}')
+                ax.axis('off')
+
+                # Add colorbar to rightmost column
+                if sample_idx == n_samples - 1:
+                    divider = make_axes_locatable(ax)
+                    cax = divider.append_axes("right", size="5%", pad=0.05)
+                    plt.colorbar(im, cax=cax)
+
+        plt.suptitle('Attention Maps Overview\n(Showing present structures only)', fontsize=14)
+        plt.tight_layout()
+        plt.savefig(self.output_dir / 'attention_maps_overview.png', dpi=150, bbox_inches='tight')
+        plt.close()
+
+    def visualize_segmentation_comparison(self):
+        """Create detailed segmentation comparison visualizations"""
+        if not self.visualization_samples:
+            return
+
+        for sample_idx, sample in enumerate(self.visualization_samples):
+            if not sample['present_structures']:
+                continue
+
+            n_structures = len(sample['present_structures'])
+            fig, axes = plt.subplots(4, n_structures, figsize=(4 * n_structures, 16))
+            if n_structures == 1:
+                axes = axes.reshape(-1, 1)
+
+            img_slice = np.rot90(sample['image_slice'], -1)
+
+            for struct_idx, (orig_idx, struct_name) in enumerate(sample['present_structures']):
+                if struct_name not in sample['true_masks'] or struct_name not in sample['pred_masks']:
+                    continue
+
+                true_mask = sample['true_masks'][struct_name]
+                pred_mask = sample['pred_masks'][struct_name]
+
+                true_mask_rot = np.rot90(true_mask, -1)
+                pred_mask_rot = np.rot90(pred_mask, -1)
+
+                # Original image
+                axes[0, struct_idx].imshow(img_slice, cmap='gray', vmin=0, vmax=255)
+                axes[0, struct_idx].set_title(f'{struct_name}\nOriginal')
+                axes[0, struct_idx].axis('off')
+
+                # True segmentation overlay
+                axes[1, struct_idx].imshow(img_slice, cmap='gray', alpha=0.7, vmin=0, vmax=255)
+                axes[1, struct_idx].imshow(true_mask_rot, cmap='Greens', alpha=0.6, vmin=0, vmax=1)
+                axes[1, struct_idx].set_title('True Segmentation')
+                axes[1, struct_idx].axis('off')
+
+                # Predicted segmentation overlay
+                axes[2, struct_idx].imshow(img_slice, cmap='gray', alpha=0.7, vmin=0, vmax=255)
+                axes[2, struct_idx].imshow(pred_mask_rot, cmap='Reds', alpha=0.6, vmin=0, vmax=1)
+                axes[2, struct_idx].set_title('Predicted Segmentation')
+                axes[2, struct_idx].axis('off')
+
+                # Difference visualization
+                true_binary = (true_mask > 0.5).astype(int)
+                pred_binary = (pred_mask > 0.5).astype(int)
+
+                diff_map = np.zeros((*true_binary.shape, 3))
+
+                tp_mask = (true_binary == 1) & (pred_binary == 1)
+                fp_mask = (true_binary == 0) & (pred_binary == 1)
+                fn_mask = (true_binary == 1) & (pred_binary == 0)
+
+                diff_map[tp_mask] = [0, 1, 0]  # Green for TP
+                diff_map[fp_mask] = [1, 0, 0]  # Red for FP
+                diff_map[fn_mask] = [0, 0, 1]  # Blue for FN
+
+                axes[3, struct_idx].imshow(np.rot90(diff_map, -1))
+
+                dice = self.dice_coefficient(pred_binary, true_binary)
+                iou = self.iou_score(pred_binary, true_binary)
+
+                axes[3, struct_idx].set_title(f'Difference Map\nDice: {dice:.3f}, IoU: {iou:.3f}\n'
+                                              f'Green=TP, Red=FP, Blue=FN')
+                axes[3, struct_idx].axis('off')
+
+            plt.suptitle(f'Segmentation Analysis - Sample {sample["index"]}\nScenario: {sample["scenario"]}',
+                         fontsize=14)
+            plt.tight_layout()
+            plt.savefig(self.output_dir / f'segmentation_analysis_sample_{sample_idx + 1}.png',
+                        dpi=150, bbox_inches='tight')
+            plt.close()
 
     def visualize_selected_samples(self):
         """Visualize selected samples stored during evaluation"""
@@ -970,7 +1377,10 @@ def main():
     print("Generated files:")
     print("  - evaluation_report.txt: Detailed text report")
     print("  - detailed_metrics.json: All metrics in JSON format")
-    print("  - sample_predictions_*.png: Selected sample visualizations")
+    print("  - comprehensive_analysis_sample_*.png: Detailed analysis with attention maps and segmentation")
+    print("  - attention_maps_overview.png: Attention patterns across samples and structures")
+    print("  - segmentation_analysis_sample_*.png: Detailed segmentation comparisons")
+    print("  - sample_predictions_*.png: Basic sample visualizations")
     print("  - presence_detection_metrics.png: Presence detection performance")
     print("  - segmentation_metrics.png: Segmentation performance")
     print("  - scenario_analysis.png: Performance by scenario")
