@@ -1,4 +1,6 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
@@ -6,15 +8,18 @@ import seaborn as sns
 from pathlib import Path
 import json
 import argparse
+from typing import Dict, List, Tuple, Optional, Any
 import pandas as pd
-from collections import defaultdict
+from collections import defaultdict, Counter
 from sklearn.metrics import (
     classification_report, confusion_matrix, roc_auc_score,
     precision_recall_curve, roc_curve, average_precision_score
 )
+from sklearn.preprocessing import label_binarize
 import h5py
 from tqdm import tqdm
 import warnings
+from matplotlib.patches import Rectangle
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 warnings.filterwarnings('ignore')
@@ -28,86 +33,76 @@ from sadaan import SpatialAttentionMedicalSegmenter, SpatialAttentionLoss
 
 
 class HDF5MedicalDataset(torch.utils.data.Dataset):
-    def __init__(self, hdf5_path, split='test', indices=None, transform=None):
-        self.hdf5_path = str(hdf5_path) + split + '.h5'
+    """PyTorch Dataset that loads samples on-demand from HDF5"""
+
+    def __init__(self, data_path: str, split: str = 'test', transform=None):
+        """
+        Args:
+            data_path: Path to the HDF5 dataset directory
+            split: Dataset split ('train', 'val', 'test')
+            transform: Optional transform function
+        """
+        self.data_path = Path(data_path)
         self.split = split
         self.transform = transform
-        self.indices = indices
 
-        self._swmr_supported = getattr(h5py.get_config(), "swmr_support", False)
-        self.use_swmr = False
+        # Load metadata
+        with open(self.data_path / 'metadata.json', 'r') as f:
+            self.metadata = json.load(f)
 
-        # Read metadata once
-        with h5py.File(self.hdf5_path, "r") as f:
-            if self.split in f and 'images' in f[self.split]:
-                root = f[self.split]
-            else:
-                root = f
-            self.n_samples = len(root['images'])
-            self.structure_names = list(f.attrs.get('structure_names', [])) if 'structure_names' in f.attrs else None
-            self.image_size = tuple(f.attrs.get('image_size')) if 'image_size' in f.attrs else None
+        self.structure_names = self.metadata['structure_names']
+        self.image_size = self.metadata['image_size']
 
-        if self.indices is None:
-            self.indices = list(range(self.n_samples))
+        # Open HDF5 file
+        self.hdf5_path = self.data_path / f'{self.split}.h5'
+        if not self.hdf5_path.exists():
+            raise FileNotFoundError(f"HDF5 file not found: {self.hdf5_path}")
 
-        # Try SWMR mode if supported
-        if self._swmr_supported:
-            try:
-                with h5py.File(self.hdf5_path, "r", swmr=True, libver="latest") as f:
-                    if self.split in f and 'images' in f[self.split]:
-                        _ = f[self.split]['images'][0]
-                    else:
-                        _ = f['images'][0]
-                self.use_swmr = True
-                print(f"[HDF5MedicalDataset] Using SWMR mode for {self.hdf5_path}")
-            except (OSError, ValueError, IOError):
-                self.use_swmr = False
-                print(f"[HDF5MedicalDataset] SWMR not usable, falling back to normal read mode")
-        else:
-            print("[HDF5MedicalDataset] h5py not built with SWMR support; using normal read mode")
+        # Open file and get basic info
+        self.hdf5_file = h5py.File(self.hdf5_path, 'r')
+        self.n_samples = self.hdf5_file.attrs['n_samples']
+
+        # Preload scenarios for faster access
+        self.scenarios = [s.decode('utf-8') if isinstance(s, bytes) else s
+                          for s in self.hdf5_file['scenarios'][:]]
 
     def __len__(self):
-        return len(self.indices)
+        return self.n_samples
 
     def __getitem__(self, idx):
-        real_idx = self.indices[idx]
+        if idx >= self.n_samples:
+            raise IndexError(f"Index {idx} out of range for dataset of size {self.n_samples}")
 
-        open_kwargs = {"mode": "r"}
-        if self.use_swmr:
-            open_kwargs.update({"swmr": True, "libver": "latest"})
+        # Load image and labels
+        image = self.hdf5_file['images'][idx]
+        masks = self.hdf5_file['masks'][idx]
+        presence_labels = self.hdf5_file['presence_labels'][idx]
+        scenario = self.scenarios[idx]
 
-        with h5py.File(self.hdf5_path, **open_kwargs) as f:
-            if self.split in f and 'images' in f[self.split]:
-                root = f[self.split]
-            else:
-                root = f
-            image = np.array(root['images'][real_idx], dtype=np.float32)
-            masks = np.array(root['masks'][real_idx], dtype=np.float32)
-            presence = np.array(root['presence_labels'][real_idx])
-            scenario = root['scenarios'][real_idx]
-            if isinstance(scenario, bytes):
-                try:
-                    scenario = scenario.decode("utf-8")
-                except Exception:
-                    scenario = str(scenario)
-
-        image = torch.from_numpy(image).float()
-        masks = torch.from_numpy(masks).float()
-        presence = torch.from_numpy(presence).long()
-
-        if image.ndim == 2:
-            image = image.unsqueeze(0)
-
-        if self.transform is not None:
+        # Apply transforms if specified
+        if self.transform:
             image = self.transform(image)
 
+        # Convert to torch tensors
+        image = torch.from_numpy(image.astype(np.float32))
+        masks = torch.from_numpy(masks.astype(np.float32))
+        presence_labels = torch.from_numpy(presence_labels.astype(np.int64))
+
+        # Add channel dimension to image
+        image = image.unsqueeze(0)  # [1, H, W, D]
+
         return {
-            "image": image,
-            "masks": masks,
-            "presence_labels": presence,
-            "scenario": scenario,
-            "index": real_idx
+            'image': image,
+            'masks': masks,
+            'presence_labels': presence_labels,
+            'scenario': scenario,
+            'index': idx
         }
+
+    def __del__(self):
+        """Clean up HDF5 file handle"""
+        if hasattr(self, 'hdf5_file'):
+            self.hdf5_file.close()
 
 
 class ModelEvaluator:
@@ -131,7 +126,7 @@ class ModelEvaluator:
             'attention_maps': [],
             'position_priors': [],
             'feature_responses': [],
-            'raw_logits': [],
+            'raw_segmentation_logits': [],
             'scenarios': [],
             'sample_indices': [],
             'images': [],
@@ -180,11 +175,11 @@ class ModelEvaluator:
                 pred_masks_np = outputs['segmentation_probs'][i].cpu().numpy()
                 pred_presence_np = outputs['presence_probs'][i].cpu().numpy()
 
-                # Store attention maps and other model internals
+                # Store attention maps and anatomical priors
                 attention_maps_np = outputs['attention_maps'][i].cpu().numpy()
                 position_priors_np = outputs['position_priors'][i].cpu().numpy()
                 feature_responses_np = outputs['feature_responses'][i].cpu().numpy()
-                raw_logits_np = outputs['raw_logits'][i].cpu().numpy()
+                raw_seg_logits_np = outputs['raw_logits'][i].cpu().numpy()
 
                 # Calculate confidence scores (entropy-based)
                 presence_probs = outputs['presence_probs'][i].cpu().numpy()
@@ -199,7 +194,7 @@ class ModelEvaluator:
                 self.results['attention_maps'].append(attention_maps_np)
                 self.results['position_priors'].append(position_priors_np)
                 self.results['feature_responses'].append(feature_responses_np)
-                self.results['raw_logits'].append(raw_logits_np)
+                self.results['raw_segmentation_logits'].append(raw_seg_logits_np)
                 self.results['scenarios'].append(scenarios[i])
                 self.results['sample_indices'].append(indices[i].item())
                 self.results['confidence_scores'].append(confidence)
@@ -346,11 +341,6 @@ class ModelEvaluator:
 
         metrics['scenario_based'] = scenario_metrics
 
-        # ============ ATTENTION ANALYSIS METRICS ============
-        print("  Computing attention analysis metrics...")
-        attention_metrics = self.analyze_attention_quality()
-        metrics['attention_analysis'] = attention_metrics
-
         # ============ CONFIDENCE ANALYSIS ============
         print("  Computing confidence analysis...")
         # Calculate calibration metrics
@@ -380,49 +370,6 @@ class ModelEvaluator:
         print("  Metrics calculation completed!")
         return metrics
 
-    def analyze_attention_quality(self):
-        """Analyze quality of attention maps"""
-        attention_metrics = {}
-
-        for i, struct_name in enumerate(self.structure_names):
-            attention_dice_scores = []
-            attention_iou_scores = []
-            attention_coverage_scores = []
-
-            for sample_idx in range(len(self.results['attention_maps'])):
-                if self.results['presence_targets'][sample_idx][i] == 1:
-                    # Get attention map and true mask
-                    attention_map = self.results['attention_maps'][sample_idx][i]
-                    true_mask = self.results['segmentation_targets'][sample_idx][i]
-
-                    # Binarize attention map
-                    attention_binary = (attention_map > 0.5).astype(float)
-
-                    # Calculate overlap metrics
-                    att_dice = self.dice_coefficient(attention_binary, true_mask)
-                    att_iou = self.iou_score(attention_binary, true_mask)
-
-                    # Coverage: how much of the true structure is covered by attention
-                    true_positive_voxels = (attention_binary * true_mask).sum()
-                    total_true_voxels = true_mask.sum()
-                    coverage = true_positive_voxels / (total_true_voxels + 1e-8)
-
-                    attention_dice_scores.append(att_dice)
-                    attention_iou_scores.append(att_iou)
-                    attention_coverage_scores.append(coverage)
-
-            attention_metrics[struct_name] = {
-                'attention_dice_mean': np.mean(attention_dice_scores) if attention_dice_scores else 0.0,
-                'attention_dice_std': np.std(attention_dice_scores) if attention_dice_scores else 0.0,
-                'attention_iou_mean': np.mean(attention_iou_scores) if attention_iou_scores else 0.0,
-                'attention_iou_std': np.std(attention_iou_scores) if attention_iou_scores else 0.0,
-                'attention_coverage_mean': np.mean(attention_coverage_scores) if attention_coverage_scores else 0.0,
-                'attention_coverage_std': np.std(attention_coverage_scores) if attention_coverage_scores else 0.0,
-                'num_samples': len(attention_dice_scores)
-            }
-
-        return attention_metrics
-
     def create_visualizations(self, metrics, max_samples=50):
         """Create comprehensive visualizations"""
         print("Creating visualizations...")
@@ -431,21 +378,25 @@ class ModelEvaluator:
         plt.style.use('default')
         sns.set_palette("husl")
 
-        # ============ ENHANCED SAMPLE VISUALIZATIONS ============
-        print("  Creating enhanced sample visualizations...")
-        self.visualize_enhanced_samples(max_samples)
+        # ============ NEW: DETAILED SAMPLE ANALYSIS ============
+        print("  Creating detailed sample analysis...")
+        self.visualize_detailed_samples(max_samples=min(10, max_samples))
 
-        # ============ ATTENTION MAPS ANALYSIS ============
-        print("  Creating attention maps analysis...")
-        self.visualize_attention_analysis(metrics)
+        # ============ NEW: ATTENTION MAPS VISUALIZATION ============
+        print("  Creating attention maps visualization...")
+        self.visualize_attention_maps(max_samples=min(8, max_samples))
 
-        # ============ STRUCTURAL PRIORS VISUALIZATION ============
-        print("  Creating structural priors visualization...")
-        self.visualize_structural_priors()
+        # ============ NEW: ANATOMICAL PRIORS VISUALIZATION ============
+        print("  Creating anatomical priors visualization...")
+        self.visualize_anatomical_priors()
 
-        # ============ SEGMENTATION OVERLAYS ============
-        print("  Creating segmentation overlays...")
-        self.visualize_segmentation_overlays(max_samples // 2)
+        # ============ NEW: SEGMENTATION COMPARISON ============
+        print("  Creating segmentation comparisons...")
+        self.visualize_segmentation_comparison(max_samples=min(6, max_samples))
+
+        # ============ SAMPLE VISUALIZATIONS ============
+        print("  Creating sample visualizations...")
+        self.visualize_samples(max_samples)
 
         # ============ PRESENCE DETECTION VISUALIZATIONS ============
         print("  Creating presence detection visualizations...")
@@ -471,16 +422,275 @@ class ModelEvaluator:
         print("  Creating ROC and PR curves...")
         self.visualize_roc_pr_curves(metrics)
 
-        # ============ FEATURE RESPONSE ANALYSIS ============
-        print("  Creating feature response analysis...")
-        self.visualize_feature_responses()
-
         print("  Visualizations completed!")
 
-    def visualize_enhanced_samples(self, max_samples=50):
-        """Enhanced sample visualization with attention and segmentation"""
+    def visualize_detailed_samples(self, max_samples=10):
+        """Create detailed visualization of individual samples with all components"""
         n_samples = min(max_samples, len(self.results['images']))
-        samples_per_figure = 3
+
+        for sample_idx in range(n_samples):
+            # Get sample data
+            image = self.results['images'][sample_idx][0]  # Remove channel dim
+            scenario = self.results['scenarios'][sample_idx]
+            presence_true = self.results['presence_targets'][sample_idx]
+            presence_pred = self.results['presence_predictions'][sample_idx]
+            attention_maps = self.results['attention_maps'][sample_idx]
+            position_priors = self.results['position_priors'][sample_idx]
+
+            # Get middle slices
+            d_mid = image.shape[-1] // 2
+            h_mid = image.shape[0] // 2
+            w_mid = image.shape[1] // 2
+
+            # Create comprehensive figure
+            fig = plt.figure(figsize=(20, 15))
+
+            # Main image (axial, coronal, sagittal)
+            ax1 = plt.subplot(3, 6, 1)
+            img_axial = np.rot90(image[..., d_mid], -1)
+            ax1.imshow(img_axial, cmap='gray', vmin=0, vmax=255)
+            ax1.set_title(f'Original (Axial)\n{scenario}')
+            ax1.axis('off')
+
+            ax2 = plt.subplot(3, 6, 7)
+            img_coronal = np.rot90(image[h_mid, ...], -1)
+            ax2.imshow(img_coronal, cmap='gray', vmin=0, vmax=255)
+            ax2.set_title('Original (Coronal)')
+            ax2.axis('off')
+
+            ax3 = plt.subplot(3, 6, 13)
+            img_sagittal = np.rot90(image[:, w_mid, :], -1)
+            ax3.imshow(img_sagittal, cmap='gray', vmin=0, vmax=255)
+            ax3.set_title('Original (Sagittal)')
+            ax3.axis('off')
+
+            # Find most interesting structures (present ones with good predictions)
+            presence_pred_binary = (presence_pred > 0.5).astype(int)
+            interesting_structures = []
+            for i, struct_name in enumerate(self.structure_names):
+                if presence_true[i] == 1:  # Structure is present
+                    interesting_structures.append((i, struct_name))
+
+            # Limit to top 4 structures for visualization
+            interesting_structures = interesting_structures[:4]
+
+            # Visualize attention maps and priors for interesting structures
+            for plot_idx, (struct_idx, struct_name) in enumerate(interesting_structures):
+                col = plot_idx + 2
+
+                # Attention map (axial)
+                ax = plt.subplot(3, 6, col)
+                attention_slice = attention_maps[struct_idx, ..., d_mid]
+                im = ax.imshow(np.rot90(attention_slice, -1), cmap='hot', alpha=0.7, vmin=0, vmax=1)
+                ax.imshow(img_axial, cmap='gray', alpha=0.3, vmin=0, vmax=255)
+                ax.set_title(f'{struct_name[:8]}\nAttention (Axial)')
+                ax.axis('off')
+
+                # Position prior (coronal)
+                ax = plt.subplot(3, 6, col + 6)
+                prior_slice = position_priors[struct_idx, h_mid, ...]
+                ax.imshow(np.rot90(prior_slice, -1), cmap='viridis', alpha=0.7, vmin=-1, vmax=1)
+                ax.imshow(img_coronal, cmap='gray', alpha=0.3, vmin=0, vmax=255)
+                ax.set_title(f'{struct_name[:8]}\nPrior (Coronal)')
+                ax.axis('off')
+
+                # Combined view (sagittal)
+                ax = plt.subplot(3, 6, col + 12)
+                combined = attention_maps[struct_idx, :, w_mid, :] + position_priors[struct_idx, :, w_mid, :]
+                ax.imshow(np.rot90(combined, -1), cmap='plasma', alpha=0.7)
+                ax.imshow(img_sagittal, cmap='gray', alpha=0.3, vmin=0, vmax=255)
+                ax.set_title(f'{struct_name[:8]}\nCombined (Sagittal)')
+                ax.axis('off')
+
+            plt.suptitle(f'Sample {sample_idx + 1}: Detailed Analysis\nScenario: {scenario}', fontsize=16)
+            plt.tight_layout()
+            plt.savefig(self.output_dir / f'detailed_sample_{sample_idx + 1}.png', dpi=150, bbox_inches='tight')
+            plt.close()
+
+    def visualize_attention_maps(self, max_samples=8):
+        """Visualize attention maps for different structures"""
+        n_samples = min(max_samples, len(self.results['images']))
+        n_structures = len(self.structure_names)
+
+        # Create a comprehensive attention visualization
+        fig, axes = plt.subplots(n_samples, n_structures, figsize=(3 * n_structures, 3 * n_samples))
+        if n_samples == 1:
+            axes = axes.reshape(1, -1)
+
+        for sample_idx in range(n_samples):
+            image = self.results['images'][sample_idx][0]
+            attention_maps = self.results['attention_maps'][sample_idx]
+            presence_true = self.results['presence_targets'][sample_idx]
+
+            # Get middle slice
+            d_mid = image.shape[-1] // 2
+            img_slice = np.rot90(image[..., d_mid], -1)
+
+            for struct_idx in range(n_structures):
+                ax = axes[sample_idx, struct_idx]
+
+                # Show attention map overlaid on image
+                attention_slice = attention_maps[struct_idx, ..., d_mid]
+                attention_slice = np.rot90(attention_slice, -1)
+
+                # Background image
+                ax.imshow(img_slice, cmap='gray', alpha=0.6, vmin=0, vmax=255)
+
+                # Attention overlay
+                im = ax.imshow(attention_slice, cmap='hot', alpha=0.7, vmin=0, vmax=1)
+
+                # Title with presence info
+                is_present = "✓" if presence_true[struct_idx] == 1 else "✗"
+                ax.set_title(f'{self.structure_names[struct_idx][:8]} {is_present}', fontsize=10)
+                ax.axis('off')
+
+                # Add colorbar for the first row
+                if sample_idx == 0:
+                    divider = make_axes_locatable(ax)
+                    cax = divider.append_axes("right", size="5%", pad=0.05)
+                    plt.colorbar(im, cax=cax)
+
+        plt.suptitle('Attention Maps by Structure and Sample\n(✓=Present, ✗=Absent)', fontsize=14)
+        plt.tight_layout()
+        plt.savefig(self.output_dir / 'attention_maps_overview.png', dpi=150, bbox_inches='tight')
+        plt.close()
+
+    def visualize_anatomical_priors(self):
+        """Visualize learned anatomical position priors"""
+        # Get the first sample to extract priors (they should be the same for all samples)
+        if len(self.results['position_priors']) == 0:
+            print("    No position priors available for visualization")
+            return
+
+        position_priors = self.results['position_priors'][0]  # [num_structures, D, H, W]
+        n_structures = len(self.structure_names)
+
+        # Create visualization showing priors in different views
+        fig, axes = plt.subplots(3, n_structures, figsize=(3 * n_structures, 12))
+        if n_structures == 1:
+            axes = axes.reshape(-1, 1)
+
+        for struct_idx in range(n_structures):
+            prior = position_priors[struct_idx]  # [D, H, W]
+
+            # Get middle slices
+            d_mid = prior.shape[0] // 2
+            h_mid = prior.shape[1] // 2
+            w_mid = prior.shape[2] // 2
+
+            # Axial view
+            ax = axes[0, struct_idx]
+            im1 = ax.imshow(np.rot90(prior[d_mid, ...], -1), cmap='coolwarm', vmin=-2, vmax=2)
+            ax.set_title(f'{self.structure_names[struct_idx]}\nAxial Prior')
+            ax.axis('off')
+            plt.colorbar(im1, ax=ax, fraction=0.046, pad=0.04)
+
+            # Coronal view
+            ax = axes[1, struct_idx]
+            im2 = ax.imshow(np.rot90(prior[:, h_mid, :], -1), cmap='coolwarm', vmin=-2, vmax=2)
+            ax.set_title('Coronal Prior')
+            ax.axis('off')
+            plt.colorbar(im2, ax=ax, fraction=0.046, pad=0.04)
+
+            # Sagittal view
+            ax = axes[2, struct_idx]
+            im3 = ax.imshow(np.rot90(prior[:, :, w_mid], -1), cmap='coolwarm', vmin=-2, vmax=2)
+            ax.set_title('Sagittal Prior')
+            ax.axis('off')
+            plt.colorbar(im3, ax=ax, fraction=0.046, pad=0.04)
+
+        plt.suptitle('Learned Anatomical Position Priors\n(Red=High Prior, Blue=Low Prior)', fontsize=16)
+        plt.tight_layout()
+        plt.savefig(self.output_dir / 'anatomical_priors.png', dpi=150, bbox_inches='tight')
+        plt.close()
+
+    def visualize_segmentation_comparison(self, max_samples=6):
+        """Compare true segmentations with predictions"""
+        n_samples = min(max_samples, len(self.results['images']))
+
+        for sample_idx in range(n_samples):
+            image = self.results['images'][sample_idx][0]
+            true_masks = self.results['segmentation_targets'][sample_idx]
+            pred_masks = self.results['segmentation_predictions'][sample_idx]
+            presence_true = self.results['presence_targets'][sample_idx]
+            scenario = self.results['scenarios'][sample_idx]
+
+            # Find present structures
+            present_structures = [(i, name) for i, name in enumerate(self.structure_names)
+                                  if presence_true[i] == 1]
+
+            if not present_structures:
+                continue
+
+            n_present = len(present_structures)
+            fig, axes = plt.subplots(3, n_present, figsize=(4 * n_present, 12))
+            if n_present == 1:
+                axes = axes.reshape(-1, 1)
+
+            # Get middle slice
+            d_mid = image.shape[-1] // 2
+            img_slice = np.rot90(image[..., d_mid], -1)
+
+            for col, (struct_idx, struct_name) in enumerate(present_structures):
+                true_mask = true_masks[struct_idx, ..., d_mid]
+                pred_mask = pred_masks[struct_idx, ..., d_mid]
+
+                true_mask = np.rot90(true_mask, -1)
+                pred_mask = np.rot90(pred_mask, -1)
+
+                # Original with true mask overlay
+                ax = axes[0, col]
+                ax.imshow(img_slice, cmap='gray', alpha=0.7, vmin=0, vmax=255)
+                ax.imshow(true_mask, cmap='Greens', alpha=0.5, vmin=0, vmax=1)
+                ax.set_title(f'{struct_name}\nTrue Segmentation')
+                ax.axis('off')
+
+                # Original with predicted mask overlay
+                ax = axes[1, col]
+                ax.imshow(img_slice, cmap='gray', alpha=0.7, vmin=0, vmax=255)
+                ax.imshow(pred_mask, cmap='Reds', alpha=0.5, vmin=0, vmax=1)
+                ax.set_title(f'{struct_name}\nPredicted Segmentation')
+                ax.axis('off')
+
+                # Difference map (TP=white, FP=red, FN=blue, TN=black)
+                ax = axes[2, col]
+                true_binary = (true_mask > 0.5).astype(int)
+                pred_binary = (pred_mask > 0.5).astype(int)
+
+                diff_map = np.zeros((*true_binary.shape, 3))  # RGB
+
+                # True Positives (white)
+                tp_mask = (true_binary == 1) & (pred_binary == 1)
+                diff_map[tp_mask] = [1, 1, 1]
+
+                # False Positives (red)
+                fp_mask = (true_binary == 0) & (pred_binary == 1)
+                diff_map[fp_mask] = [1, 0, 0]
+
+                # False Negatives (blue)
+                fn_mask = (true_binary == 1) & (pred_binary == 0)
+                diff_map[fn_mask] = [0, 0, 1]
+
+                # True Negatives (black) - already initialized as [0,0,0]
+
+                ax.imshow(diff_map)
+
+                # Calculate metrics for this structure
+                dice = self.dice_coefficient(pred_binary, true_binary)
+                iou = self.iou_score(pred_binary, true_binary)
+
+                ax.set_title(f'{struct_name}\nDice: {dice:.3f}, IoU: {iou:.3f}\nTP=White, FP=Red, FN=Blue')
+                ax.axis('off')
+
+            plt.suptitle(f'Sample {sample_idx + 1}: Segmentation Comparison\nScenario: {scenario}', fontsize=14)
+            plt.tight_layout()
+            plt.savefig(self.output_dir / f'segmentation_comparison_{sample_idx + 1}.png', dpi=150, bbox_inches='tight')
+            plt.close()
+
+    def visualize_samples(self, max_samples=50):
+        """Visualize individual test samples with predictions"""
+        n_samples = min(max_samples, len(self.results['images']))
+        samples_per_figure = 6
         n_figures = (n_samples + samples_per_figure - 1) // samples_per_figure
 
         for fig_idx in range(n_figures):
@@ -488,7 +698,7 @@ class ModelEvaluator:
             end_idx = min(start_idx + samples_per_figure, n_samples)
             current_samples = end_idx - start_idx
 
-            fig, axes = plt.subplots(current_samples, 8, figsize=(32, 4 * current_samples))
+            fig, axes = plt.subplots(current_samples, 4, figsize=(20, 5 * current_samples))
             if current_samples == 1:
                 axes = axes.reshape(1, -1)
 
@@ -508,362 +718,57 @@ class ModelEvaluator:
 
                 # Original image
                 axes[sample_idx, 0].imshow(img_slice, cmap='gray', vmin=0, vmax=255)
-                axes[sample_idx, 0].set_title(f'Original\nScenario: {scenario[:20]}...')
+                axes[sample_idx, 0].set_title(f'Original\nScenario: {scenario}')
                 axes[sample_idx, 0].axis('off')
 
-                # True segmentation overlay
-                true_seg_overlay = img_slice.copy()
-                for struct_idx in range(min(3, len(self.structure_names))):  # Show first 3 structures
-                    if presence_true[struct_idx] == 1:
-                        true_mask_slice = self.results['segmentation_targets'][idx][struct_idx][..., middle_slice]
-                        true_mask_slice = np.rot90(true_mask_slice, -1)
-                        true_seg_overlay[true_mask_slice > 0.5] = 150 + struct_idx * 30
+                # True presence labels
+                present_true = [self.structure_names[i] for i, p in enumerate(presence_true) if p == 1]
+                absent_true = [self.structure_names[i] for i, p in enumerate(presence_true) if p == 0]
 
-                axes[sample_idx, 1].imshow(true_seg_overlay, cmap='viridis')
-                axes[sample_idx, 1].set_title('True Segmentation\n(First 3 structures)')
+                text_true = f"Present ({len(present_true)}):\n"
+                text_true += "\n".join(present_true[:8])  # Limit to first 8
+                if len(present_true) > 8:
+                    text_true += f"\n...and {len(present_true) - 8} more"
+
+                axes[sample_idx, 1].text(0.05, 0.95, text_true,
+                                         transform=axes[sample_idx, 1].transAxes,
+                                         fontsize=8, verticalalignment='top', color='green')
+                axes[sample_idx, 1].set_title('True Labels')
                 axes[sample_idx, 1].axis('off')
 
-                # Predicted segmentation overlay
-                pred_seg_overlay = img_slice.copy()
-                for struct_idx in range(min(3, len(self.structure_names))):
-                    if presence_pred[struct_idx] > 0.5:
-                        pred_mask_slice = self.results['segmentation_predictions'][idx][struct_idx][..., middle_slice]
-                        pred_mask_slice = np.rot90(pred_mask_slice, -1)
-                        pred_seg_overlay[pred_mask_slice > 0.5] = 150 + struct_idx * 30
+                # Predicted presence labels
+                presence_pred_binary = (presence_pred > 0.5).astype(int)
+                present_pred = [self.structure_names[i] for i, p in enumerate(presence_pred_binary) if p == 1]
 
-                axes[sample_idx, 2].imshow(pred_seg_overlay, cmap='viridis')
-                axes[sample_idx, 2].set_title('Predicted Segmentation\n(First 3 structures)')
+                text_pred = f"Predicted ({len(present_pred)}):\n"
+                text_pred += "\n".join(present_pred[:8])
+                if len(present_pred) > 8:
+                    text_pred += f"\n...and {len(present_pred) - 8} more"
+
+                axes[sample_idx, 2].text(0.05, 0.95, text_pred,
+                                         transform=axes[sample_idx, 2].transAxes,
+                                         fontsize=8, verticalalignment='top', color='blue')
+                axes[sample_idx, 2].set_title('Predictions')
                 axes[sample_idx, 2].axis('off')
 
-                # Attention maps for first 3 structures
-                for att_idx in range(min(3, len(self.structure_names))):
-                    attention_slice = self.results['attention_maps'][idx][att_idx][..., middle_slice]
-                    attention_slice = np.rot90(attention_slice, -1)
-
-                    im = axes[sample_idx, 3 + att_idx].imshow(attention_slice, cmap='hot', vmin=0, vmax=1)
-                    axes[sample_idx, 3 + att_idx].set_title(f'Attention: {self.structure_names[att_idx][:8]}')
-                    axes[sample_idx, 3 + att_idx].axis('off')
-
-                    # Add colorbar
-                    divider = make_axes_locatable(axes[sample_idx, 3 + att_idx])
-                    cax = divider.append_axes("right", size="5%", pad=0.05)
-                    plt.colorbar(im, cax=cax)
-
-                # Position priors for first structure
-                if len(self.results['position_priors']) > 0:
-                    prior_slice = self.results['position_priors'][idx][0][..., middle_slice]
-                    prior_slice = np.rot90(prior_slice, -1)
-
-                    im = axes[sample_idx, 6].imshow(prior_slice, cmap='plasma', vmin=0, vmax=1)
-                    axes[sample_idx, 6].set_title(f'Position Prior\n{self.structure_names[0][:8]}')
-                    axes[sample_idx, 6].axis('off')
-
-                    divider = make_axes_locatable(axes[sample_idx, 6])
-                    cax = divider.append_axes("right", size="5%", pad=0.05)
-                    plt.colorbar(im, cax=cax)
-
-                # Presence predictions summary
-                presence_pred_binary = (presence_pred > 0.5).astype(int)
-                correct_predictions = (presence_pred_binary == presence_true).astype(float)
+                # Prediction confidence heatmap
                 conf_scores = self.results['confidence_scores'][idx]
+                correct_predictions = (presence_pred_binary == presence_true).astype(float)
 
-                y_pos = np.arange(min(8, len(self.structure_names)))
-                colors = ['red' if c == 0 else 'green' for c in correct_predictions[:len(y_pos)]]
+                # Create a simple heatmap showing confidence and correctness
+                y_pos = np.arange(len(self.structure_names))
+                colors = ['red' if c == 0 else 'green' for c in correct_predictions]
 
-                bars = axes[sample_idx, 7].barh(y_pos, presence_pred[:len(y_pos)], color=colors, alpha=0.7)
-                axes[sample_idx, 7].set_yticks(y_pos)
-                axes[sample_idx, 7].set_yticklabels([name[:8] for name in self.structure_names[:len(y_pos)]],
-                                                    fontsize=6)
-                axes[sample_idx, 7].set_xlabel('Presence Probability')
-                axes[sample_idx, 7].set_title('Presence Predictions\n(Green=Correct, Red=Wrong)')
-                axes[sample_idx, 7].set_xlim(0, 1)
-                axes[sample_idx, 7].axvline(x=0.5, color='black', linestyle='--', alpha=0.5)
+                bars = axes[sample_idx, 3].barh(y_pos, conf_scores, color=colors, alpha=0.7)
+                axes[sample_idx, 3].set_yticks(y_pos)
+                axes[sample_idx, 3].set_yticklabels([name[:8] for name in self.structure_names], fontsize=6)
+                axes[sample_idx, 3].set_xlabel('Confidence')
+                axes[sample_idx, 3].set_title('Confidence & Correctness\n(Green=Correct, Red=Wrong)')
+                axes[sample_idx, 3].set_xlim(0, 1)
 
             plt.tight_layout()
-            plt.savefig(self.output_dir / f'enhanced_sample_predictions_{fig_idx + 1}.png',
-                        dpi=150, bbox_inches='tight')
+            plt.savefig(self.output_dir / f'sample_predictions_{fig_idx + 1}.png', dpi=150, bbox_inches='tight')
             plt.close()
-
-    def visualize_attention_analysis(self, metrics):
-        """Visualize attention map quality analysis"""
-        attention_metrics = metrics['attention_analysis']
-
-        structures = list(attention_metrics.keys())
-        attention_dice = [attention_metrics[s]['attention_dice_mean'] for s in structures]
-        attention_iou = [attention_metrics[s]['attention_iou_mean'] for s in structures]
-        attention_coverage = [attention_metrics[s]['attention_coverage_mean'] for s in structures]
-
-        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-
-        # Attention Dice scores
-        x_pos = np.arange(len(structures))
-        bars1 = axes[0, 0].bar(x_pos, attention_dice, color='lightblue', alpha=0.8)
-        axes[0, 0].set_title('Attention Map Quality: Dice Overlap with True Masks')
-        axes[0, 0].set_xlabel('Anatomical Structures')
-        axes[0, 0].set_ylabel('Dice Score')
-        axes[0, 0].set_xticks(x_pos)
-        axes[0, 0].set_xticklabels([s[:8] for s in structures], rotation=45, ha='right')
-        axes[0, 0].set_ylim(0, 1)
-
-        # Add value labels
-        for i, bar in enumerate(bars1):
-            height = bar.get_height()
-            axes[0, 0].text(bar.get_x() + bar.get_width() / 2., height + 0.01,
-                            f'{height:.3f}', ha='center', va='bottom', fontsize=8)
-
-        # Attention IoU scores
-        bars2 = axes[0, 1].bar(x_pos, attention_iou, color='lightgreen', alpha=0.8)
-        axes[0, 1].set_title('Attention Map Quality: IoU Overlap with True Masks')
-        axes[0, 1].set_xlabel('Anatomical Structures')
-        axes[0, 1].set_ylabel('IoU Score')
-        axes[0, 1].set_xticks(x_pos)
-        axes[0, 1].set_xticklabels([s[:8] for s in structures], rotation=45, ha='right')
-        axes[0, 1].set_ylim(0, 1)
-
-        # Attention coverage
-        bars3 = axes[1, 0].bar(x_pos, attention_coverage, color='coral', alpha=0.8)
-        axes[1, 0].set_title('Attention Coverage: % of True Structure Attended')
-        axes[1, 0].set_xlabel('Anatomical Structures')
-        axes[1, 0].set_ylabel('Coverage Ratio')
-        axes[1, 0].set_xticks(x_pos)
-        axes[1, 0].set_xticklabels([s[:8] for s in structures], rotation=45, ha='right')
-        axes[1, 0].set_ylim(0, 1)
-
-        # Scatter plot: attention quality vs segmentation quality
-        seg_metrics = metrics['segmentation_per_structure']
-        seg_dice = [seg_metrics[s]['mean_dice'] for s in structures]
-
-        axes[1, 1].scatter(attention_dice, seg_dice, s=100, alpha=0.7, c='purple')
-        for i, struct in enumerate(structures):
-            axes[1, 1].annotate(struct[:6], (attention_dice[i], seg_dice[i]),
-                                xytext=(5, 5), textcoords='offset points', fontsize=8)
-        axes[1, 1].set_xlabel('Attention Quality (Dice)')
-        axes[1, 1].set_ylabel('Segmentation Quality (Dice)')
-        axes[1, 1].set_title('Attention Quality vs Segmentation Quality')
-        axes[1, 1].plot([0, 1], [0, 1], 'k--', alpha=0.5, label='Perfect correlation')
-        axes[1, 1].legend()
-        axes[1, 1].set_xlim(0, 1)
-        axes[1, 1].set_ylim(0, 1)
-
-        plt.tight_layout()
-        plt.savefig(self.output_dir / 'attention_analysis.png', dpi=150, bbox_inches='tight')
-        plt.close()
-
-    def visualize_structural_priors(self):
-        """Visualize learned structural position priors"""
-        if not self.results['position_priors']:
-            print("    No position priors available, skipping visualization")
-            return
-
-        # Get average position priors across all samples
-        all_priors = np.array(self.results['position_priors'])  # [N, num_structures, D, H, W]
-        mean_priors = np.mean(all_priors, axis=0)  # [num_structures, D, H, W]
-
-        n_structures = min(len(self.structure_names), mean_priors.shape[0])
-
-        # Create visualization for middle slices (axial, sagittal, coronal)
-        fig, axes = plt.subplots(n_structures, 4, figsize=(16, 4 * n_structures))
-        if n_structures == 1:
-            axes = axes.reshape(1, -1)
-
-        for i in range(n_structures):
-            struct_name = self.structure_names[i]
-            prior = mean_priors[i]  # [D, H, W]
-
-            # Get middle slices
-            mid_d, mid_h, mid_w = prior.shape[0] // 2, prior.shape[1] // 2, prior.shape[2] // 2
-
-            # Axial slice (D dimension)
-            axial_slice = np.rot90(prior[mid_d, :, :], -1)
-            im1 = axes[i, 0].imshow(axial_slice, cmap='hot', vmin=0, vmax=prior.max())
-            axes[i, 0].set_title(f'{struct_name}\nAxial (z={mid_d})')
-            axes[i, 0].axis('off')
-            plt.colorbar(im1, ax=axes[i, 0], fraction=0.046, pad=0.04)
-
-            # Sagittal slice (W dimension)
-            sagittal_slice = np.rot90(prior[:, :, mid_w], -1)
-            im2 = axes[i, 1].imshow(sagittal_slice, cmap='hot', vmin=0, vmax=prior.max())
-            axes[i, 1].set_title(f'Sagittal (x={mid_w})')
-            axes[i, 1].axis('off')
-            plt.colorbar(im2, ax=axes[i, 1], fraction=0.046, pad=0.04)
-
-            # Coronal slice (H dimension)
-            coronal_slice = np.rot90(prior[:, mid_h, :], -1)
-            im3 = axes[i, 2].imshow(coronal_slice, cmap='hot', vmin=0, vmax=prior.max())
-            axes[i, 2].set_title(f'Coronal (y={mid_h})')
-            axes[i, 2].axis('off')
-            plt.colorbar(im3, ax=axes[i, 2], fraction=0.046, pad=0.04)
-
-            # 3D visualization as maximum intensity projection
-            mip = np.max(prior, axis=0)  # Max along depth
-            mip = np.rot90(mip, -1)
-            im4 = axes[i, 3].imshow(mip, cmap='hot', vmin=0, vmax=mip.max())
-            axes[i, 3].set_title('Max Intensity Projection')
-            axes[i, 3].axis('off')
-            plt.colorbar(im4, ax=axes[i, 3], fraction=0.046, pad=0.04)
-
-        plt.suptitle('Learned Structural Position Priors', fontsize=16)
-        plt.tight_layout()
-        plt.savefig(self.output_dir / 'structural_position_priors.png', dpi=150, bbox_inches='tight')
-        plt.close()
-
-    def visualize_segmentation_overlays(self, max_samples=25):
-        """Create detailed segmentation overlays with attention maps"""
-        n_samples = min(max_samples, len(self.results['images']))
-
-        for sample_idx in range(n_samples):
-            # Create a detailed visualization for each sample
-            fig, axes = plt.subplots(3, len(self.structure_names),
-                                     figsize=(4 * len(self.structure_names), 12))
-
-            image = self.results['images'][sample_idx][0]
-            scenario = self.results['scenarios'][sample_idx]
-            presence_true = self.results['presence_targets'][sample_idx]
-            presence_pred = self.results['presence_predictions'][sample_idx]
-
-            # Get middle slice
-            middle_slice = image.shape[-1] // 2
-            img_slice = np.rot90(image[..., middle_slice], -1)
-
-            for struct_idx, struct_name in enumerate(self.structure_names):
-                # Row 1: True mask overlay
-                true_overlay = img_slice.copy()
-                if presence_true[struct_idx] == 1:
-                    true_mask = self.results['segmentation_targets'][sample_idx][struct_idx]
-                    true_mask_slice = np.rot90(true_mask[..., middle_slice], -1)
-                    true_overlay[true_mask_slice > 0.5] = 255
-
-                axes[0, struct_idx].imshow(true_overlay, cmap='gray')
-                axes[0, struct_idx].set_title(f'{struct_name}\nTrue (Present: {presence_true[struct_idx]})')
-                axes[0, struct_idx].axis('off')
-
-                # Row 2: Predicted mask overlay
-                pred_overlay = img_slice.copy()
-                pred_mask = self.results['segmentation_predictions'][sample_idx][struct_idx]
-                pred_mask_slice = np.rot90(pred_mask[..., middle_slice], -1)
-                pred_overlay[pred_mask_slice > 0.5] = 255
-
-                axes[1, struct_idx].imshow(pred_overlay, cmap='gray')
-                axes[1, struct_idx].set_title(f'Predicted (Prob: {presence_pred[struct_idx]:.3f})')
-                axes[1, struct_idx].axis('off')
-
-                # Row 3: Attention map
-                attention_map = self.results['attention_maps'][sample_idx][struct_idx]
-                attention_slice = np.rot90(attention_map[..., middle_slice], -1)
-
-                im = axes[2, struct_idx].imshow(attention_slice, cmap='hot', vmin=0, vmax=1)
-                axes[2, struct_idx].set_title('Attention Map')
-                axes[2, struct_idx].axis('off')
-
-                # Add colorbar for attention
-                divider = make_axes_locatable(axes[2, struct_idx])
-                cax = divider.append_axes("right", size="5%", pad=0.05)
-                plt.colorbar(im, cax=cax)
-
-            plt.suptitle(f'Sample {sample_idx}: {scenario}', fontsize=14)
-            plt.tight_layout()
-            plt.savefig(self.output_dir / f'detailed_segmentation_sample_{sample_idx:03d}.png',
-                        dpi=150, bbox_inches='tight')
-            plt.close()
-
-    def visualize_feature_responses(self):
-        """Visualize feature response patterns"""
-        if not self.results['feature_responses']:
-            print("    No feature responses available, skipping visualization")
-            return
-
-        # Analyze feature response statistics
-        all_responses = np.array(self.results['feature_responses'])  # [N, num_structures, D, H, W]
-
-        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-
-        # 1. Mean feature response by structure
-        mean_responses = np.mean(all_responses, axis=(0, 2, 3, 4))  # [num_structures]
-
-        axes[0, 0].bar(range(len(self.structure_names)), mean_responses, color='skyblue')
-        axes[0, 0].set_title('Mean Feature Response by Structure')
-        axes[0, 0].set_xlabel('Anatomical Structures')
-        axes[0, 0].set_ylabel('Mean Response')
-        axes[0, 0].set_xticks(range(len(self.structure_names)))
-        axes[0, 0].set_xticklabels([s[:8] for s in self.structure_names], rotation=45)
-
-        # 2. Feature response variability
-        std_responses = np.std(all_responses, axis=(0, 2, 3, 4))
-
-        axes[0, 1].bar(range(len(self.structure_names)), std_responses, color='lightcoral')
-        axes[0, 1].set_title('Feature Response Variability')
-        axes[0, 1].set_xlabel('Anatomical Structures')
-        axes[0, 1].set_ylabel('Standard Deviation')
-        axes[0, 1].set_xticks(range(len(self.structure_names)))
-        axes[0, 1].set_xticklabels([s[:8] for s in self.structure_names], rotation=45)
-
-        # 3. Response correlation between structures
-        response_correlations = np.corrcoef(mean_responses)
-        im = axes[0, 2].imshow(response_correlations, cmap='coolwarm', vmin=-1, vmax=1)
-        axes[0, 2].set_title('Inter-Structure Response Correlations')
-        axes[0, 2].set_xticks(range(len(self.structure_names)))
-        axes[0, 2].set_yticks(range(len(self.structure_names)))
-        axes[0, 2].set_xticklabels([s[:6] for s in self.structure_names], rotation=45)
-        axes[0, 2].set_yticklabels([s[:6] for s in self.structure_names])
-        plt.colorbar(im, ax=axes[0, 2])
-
-        # 4. Feature response vs presence accuracy
-        presence_metrics = {}
-        for i, struct_name in enumerate(self.structure_names):
-            presence_true = np.array([sample[i] for sample in self.results['presence_targets']])
-            presence_pred = np.array([sample[i] for sample in self.results['presence_predictions']])
-            accuracy = np.mean((presence_pred > 0.5) == presence_true)
-            presence_metrics[struct_name] = accuracy
-
-        accuracies = [presence_metrics[s] for s in self.structure_names]
-
-        axes[1, 0].scatter(mean_responses, accuracies, s=100, alpha=0.7, c='purple')
-        for i, struct in enumerate(self.structure_names):
-            axes[1, 0].annotate(struct[:6], (mean_responses[i], accuracies[i]),
-                                xytext=(5, 5), textcoords='offset points', fontsize=8)
-        axes[1, 0].set_xlabel('Mean Feature Response')
-        axes[1, 0].set_ylabel('Presence Detection Accuracy')
-        axes[1, 0].set_title('Feature Response vs Detection Accuracy')
-
-        # 5. Response distribution across samples
-        sample_means = np.mean(all_responses, axis=(1, 2, 3, 4))  # Mean across all structures and spatial dims
-
-        axes[1, 1].hist(sample_means, bins=20, alpha=0.7, color='gold', edgecolor='black')
-        axes[1, 1].set_xlabel('Mean Feature Response')
-        axes[1, 1].set_ylabel('Number of Samples')
-        axes[1, 1].set_title('Distribution of Sample-wise Feature Responses')
-
-        # 6. Feature response heatmap for first sample
-        if len(all_responses) > 0:
-            sample_response = all_responses[0]  # [num_structures, D, H, W]
-            middle_slice = sample_response.shape[-1] // 2
-
-            # Create a grid showing responses for all structures
-            response_grid = np.zeros((len(self.structure_names) * sample_response.shape[1],
-                                      sample_response.shape[2]))
-
-            for i in range(len(self.structure_names)):
-                start_row = i * sample_response.shape[1]
-                end_row = (i + 1) * sample_response.shape[1]
-                response_slice = sample_response[i, :, :, middle_slice]
-                response_grid[start_row:end_row, :] = response_slice
-
-            im = axes[1, 2].imshow(response_grid, cmap='viridis', aspect='auto')
-            axes[1, 2].set_title('Feature Response Grid (Sample 1)')
-            axes[1, 2].set_ylabel('Structure × Depth')
-            axes[1, 2].set_xlabel('Width')
-
-            # Add structure labels
-            structure_positions = [(i + 0.5) * sample_response.shape[1]
-                                   for i in range(len(self.structure_names))]
-            axes[1, 2].set_yticks(structure_positions)
-            axes[1, 2].set_yticklabels([s[:8] for s in self.structure_names])
-
-            plt.colorbar(im, ax=axes[1, 2])
-
-        plt.tight_layout()
-        plt.savefig(self.output_dir / 'feature_response_analysis.png', dpi=150, bbox_inches='tight')
-        plt.close()
 
     def visualize_presence_metrics(self, metrics):
         """Visualize presence detection performance"""
@@ -885,7 +790,7 @@ class ModelEvaluator:
         axes[0, 0].set_xlabel('Anatomical Structures')
         axes[0, 0].set_ylabel('F1 Score')
         axes[0, 0].set_xticks(range(len(structures)))
-        axes[0, 0].set_xticklabels([s[:8] for s in structures], rotation=45, ha='right')
+        axes[0, 0].set_xticklabels(structures, rotation=45, ha='right')
         axes[0, 0].set_ylim(0, 1)
 
         # Add value labels on bars
@@ -912,7 +817,7 @@ class ModelEvaluator:
         axes[1, 0].set_xlabel('Anatomical Structures')
         axes[1, 0].set_ylabel('AUC-ROC')
         axes[1, 0].set_xticks(range(len(structures)))
-        axes[1, 0].set_xticklabels([s[:8] for s in structures], rotation=45, ha='right')
+        axes[1, 0].set_xticklabels(structures, rotation=45, ha='right')
         axes[1, 0].axhline(y=0.5, color='red', linestyle='--', alpha=0.5, label='Random')
         axes[1, 0].set_ylim(0, 1)
         axes[1, 0].legend()
@@ -924,7 +829,7 @@ class ModelEvaluator:
         axes[1, 1].set_xlabel('Anatomical Structures')
         axes[1, 1].set_ylabel('Number of Positive Samples')
         axes[1, 1].set_xticks(range(len(structures)))
-        axes[1, 1].set_xticklabels([s[:8] for s in structures], rotation=45, ha='right')
+        axes[1, 1].set_xticklabels(structures, rotation=45, ha='right')
 
         plt.tight_layout()
         plt.savefig(self.output_dir / 'presence_detection_metrics.png', dpi=150, bbox_inches='tight')
@@ -950,7 +855,7 @@ class ModelEvaluator:
         axes[0].set_xlabel('Anatomical Structures')
         axes[0].set_ylabel('Dice Score')
         axes[0].set_xticks(x_pos)
-        axes[0].set_xticklabels([s[:8] for s in structures], rotation=45, ha='right')
+        axes[0].set_xticklabels(structures, rotation=45, ha='right')
         axes[0].set_ylim(0, 1)
 
         # IoU scores with error bars
@@ -959,7 +864,7 @@ class ModelEvaluator:
         axes[1].set_xlabel('Anatomical Structures')
         axes[1].set_ylabel('IoU Score')
         axes[1].set_xticks(x_pos)
-        axes[1].set_xticklabels([s[:8] for s in structures], rotation=45, ha='right')
+        axes[1].set_xticklabels(structures, rotation=45, ha='right')
         axes[1].set_ylim(0, 1)
 
         # Number of samples used for evaluation
@@ -968,7 +873,7 @@ class ModelEvaluator:
         axes[2].set_xlabel('Anatomical Structures')
         axes[2].set_ylabel('Number of Samples')
         axes[2].set_xticks(x_pos)
-        axes[2].set_xticklabels([s[:8] for s in structures], rotation=45, ha='right')
+        axes[2].set_xticklabels(structures, rotation=45, ha='right')
 
         plt.tight_layout()
         plt.savefig(self.output_dir / 'segmentation_metrics.png', dpi=150, bbox_inches='tight')
@@ -1120,9 +1025,9 @@ class ModelEvaluator:
         except Exception as e:
             print(f"    Warning: Could not create confidence vs accuracy plot: {e}")
             axes[1, 0].text(0.5, 0.5, 'Error creating confidence vs accuracy plot',
-                                            ha='center', va='center', transform=axes[1, 0].transAxes)
+                            ha='center', va='center', transform=axes[1, 0].transAxes)
 
-            # Calibration error by structure
+        # Calibration error by structure
         try:
             ece_by_structure = {}  # Expected Calibration Error
             for struct in self.structure_names:
@@ -1140,7 +1045,9 @@ class ModelEvaluator:
                 structures = list(ece_by_structure.keys())
                 ece_values = list(ece_by_structure.values())
 
+                # Create colors list with proper length
                 colors = plt.cm.Set3(np.linspace(0, 1, len(structures)))
+
                 bars = axes[1, 1].bar(range(len(structures)), ece_values, color=colors)
                 axes[1, 1].set_title('Expected Calibration Error by Structure')
                 axes[1, 1].set_xlabel('Anatomical Structures')
@@ -1278,19 +1185,6 @@ class ModelEvaluator:
         report_lines.append(f"Overall mean IoU score: {metrics['segmentation_overall']['mean_iou']:.4f}")
         report_lines.append("")
 
-        # Attention analysis summary
-        if 'attention_analysis' in metrics:
-            report_lines.append("ATTENTION ANALYSIS SUMMARY:")
-            report_lines.append("-" * 40)
-            attention_metrics = metrics['attention_analysis']
-            avg_attention_dice = np.mean([attention_metrics[s]['attention_dice_mean']
-                                          for s in self.structure_names])
-            avg_attention_coverage = np.mean([attention_metrics[s]['attention_coverage_mean']
-                                              for s in self.structure_names])
-            report_lines.append(f"Average attention-mask overlap (Dice): {avg_attention_dice:.4f}")
-            report_lines.append(f"Average attention coverage: {avg_attention_coverage:.4f}")
-            report_lines.append("")
-
         # Per-structure presence detection performance
         report_lines.append("PRESENCE DETECTION PERFORMANCE BY STRUCTURE:")
         report_lines.append("-" * 60)
@@ -1325,24 +1219,6 @@ class ModelEvaluator:
             )
 
         report_lines.append("")
-
-        # Attention analysis per structure
-        if 'attention_analysis' in metrics:
-            report_lines.append("ATTENTION ANALYSIS BY STRUCTURE:")
-            report_lines.append("-" * 60)
-            report_lines.append(f"{'Structure':<15} {'Att Dice':<10} {'Att IoU':<10} {'Coverage':<10}")
-            report_lines.append("-" * 60)
-
-            for struct_name in self.structure_names:
-                att_metrics = metrics['attention_analysis'][struct_name]
-                report_lines.append(
-                    f"{struct_name[:14]:<15} "
-                    f"{att_metrics['attention_dice_mean']:<10.4f} "
-                    f"{att_metrics['attention_iou_mean']:<10.4f} "
-                    f"{att_metrics['attention_coverage_mean']:<10.4f}"
-                )
-
-            report_lines.append("")
 
         # Scenario-based performance
         report_lines.append("PERFORMANCE BY SCENARIO:")
@@ -1391,6 +1267,8 @@ def load_model_from_checkpoint(checkpoint_path, structure_names, image_size, dev
     """Load model from checkpoint"""
     print(f"Loading model from {checkpoint_path}...")
 
+    # Load checkpoint with weights_only=False for compatibility with older checkpoints
+    # This is safe if you trust the source of your checkpoint files
     try:
         # Try loading with weights_only=True first (more secure)
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
@@ -1418,216 +1296,73 @@ def load_model_from_checkpoint(checkpoint_path, structure_names, image_size, dev
     return model
 
 
-def create_additional_tests(evaluator, metrics):
-    """Create additional specialized tests and analyses"""
-    print("Running additional specialized tests...")
+def create_attention_analysis_report(evaluator):
+    """Create a detailed analysis of attention mechanisms"""
+    print("Creating attention analysis report...")
 
-    # Test 1: Model behavior on edge cases
-    print("  Testing edge cases...")
-    edge_case_results = analyze_edge_cases(evaluator)
+    attention_maps = np.array(evaluator.results['attention_maps'])  # [N, C, D, H, W]
+    position_priors = np.array(evaluator.results['position_priors'])  # [N, C, D, H, W]
+    presence_targets = np.array(evaluator.results['presence_targets'])  # [N, C]
 
-    # Test 2: Attention consistency analysis
-    print("  Analyzing attention consistency...")
-    attention_consistency = analyze_attention_consistency(evaluator)
+    report_lines = []
+    report_lines.append("=" * 60)
+    report_lines.append("ATTENTION MECHANISM ANALYSIS REPORT")
+    report_lines.append("=" * 60)
+    report_lines.append("")
 
-    # Test 3: Multi-structure interaction analysis
-    print("  Analyzing multi-structure interactions...")
-    interaction_analysis = analyze_structure_interactions(evaluator)
-
-    # Test 4: Model uncertainty analysis
-    print("  Analyzing model uncertainty...")
-    uncertainty_analysis = analyze_model_uncertainty(evaluator)
-
-    additional_results = {
-        'edge_cases': edge_case_results,
-        'attention_consistency': attention_consistency,
-        'structure_interactions': interaction_analysis,
-        'uncertainty_analysis': uncertainty_analysis
-    }
-
-    # Save additional results
-    with open(evaluator.output_dir / 'additional_tests.json', 'w') as f:
-        json.dump(additional_results, f, indent=2)
-
-    return additional_results
-
-
-def analyze_edge_cases(evaluator):
-    """Analyze model performance on edge cases"""
-    edge_cases = {
-        'high_confidence_errors': [],
-        'low_confidence_correct': [],
-        'attention_segmentation_mismatch': [],
-        'absent_with_high_attention': []
-    }
-
-    for i, (conf_scores, presence_targets, presence_preds, attention_maps) in enumerate(
-            zip(evaluator.results['confidence_scores'],
-                evaluator.results['presence_targets'],
-                evaluator.results['presence_predictions'],
-                evaluator.results['attention_maps'])):
-
-        presence_pred_binary = (np.array(presence_preds) > 0.5).astype(int)
-
-        for j, struct_name in enumerate(evaluator.structure_names):
-            conf = conf_scores[j]
-            true_label = presence_targets[j]
-            pred_label = presence_pred_binary[j]
-            attention_mean = np.mean(attention_maps[j])
-
-            # High confidence errors
-            if conf > 0.8 and true_label != pred_label:
-                edge_cases['high_confidence_errors'].append({
-                    'sample_idx': i,
-                    'structure': struct_name,
-                    'confidence': float(conf),
-                    'true_label': int(true_label),
-                    'pred_label': int(pred_label)
-                })
-
-            # Low confidence correct predictions
-            if conf < 0.3 and true_label == pred_label:
-                edge_cases['low_confidence_correct'].append({
-                    'sample_idx': i,
-                    'structure': struct_name,
-                    'confidence': float(conf),
-                    'true_label': int(true_label),
-                    'pred_label': int(pred_label)
-                })
-
-            # Absent structures with high attention
-            if true_label == 0 and attention_mean > 0.5:
-                edge_cases['absent_with_high_attention'].append({
-                    'sample_idx': i,
-                    'structure': struct_name,
-                    'attention_mean': float(attention_mean),
-                    'true_label': int(true_label)
-                })
-
-    return edge_cases
-
-
-def analyze_attention_consistency(evaluator):
-    """Analyze consistency of attention maps across similar samples"""
-    # Group samples by scenario
-    scenario_groups = defaultdict(list)
-    for i, scenario in enumerate(evaluator.results['scenarios']):
-        scenario_groups[scenario].append(i)
-
-    consistency_metrics = {}
-
-    for scenario, sample_indices in scenario_groups.items():
-        if len(sample_indices) < 2:
-            continue
-
-        scenario_consistency = {}
-
-        for struct_idx, struct_name in enumerate(evaluator.structure_names):
-            attention_maps = []
-            for sample_idx in sample_indices:
-                if evaluator.results['presence_targets'][sample_idx][struct_idx] == 1:
-                    attention_maps.append(evaluator.results['attention_maps'][sample_idx][struct_idx])
-
-            if len(attention_maps) >= 2:
-                # Calculate pairwise correlations
-                correlations = []
-                for i in range(len(attention_maps)):
-                    for j in range(i + 1, len(attention_maps)):
-                        map1_flat = attention_maps[i].flatten()
-                        map2_flat = attention_maps[j].flatten()
-                        corr = np.corrcoef(map1_flat, map2_flat)[0, 1]
-                        if not np.isnan(corr):
-                            correlations.append(corr)
-
-                if correlations:
-                    scenario_consistency[struct_name] = {
-                        'mean_correlation': float(np.mean(correlations)),
-                        'std_correlation': float(np.std(correlations)),
-                        'num_comparisons': len(correlations)
-                    }
-
-        if scenario_consistency:
-            consistency_metrics[scenario] = scenario_consistency
-
-    return consistency_metrics
-
-
-def analyze_structure_interactions(evaluator):
-    """Analyze how the presence of one structure affects detection of others"""
-    interaction_matrix = np.zeros((len(evaluator.structure_names), len(evaluator.structure_names)))
-
-    presence_targets = np.array(evaluator.results['presence_targets'])
-    presence_preds = np.array(evaluator.results['presence_predictions'])
-
-    for i in range(len(evaluator.structure_names)):
-        for j in range(len(evaluator.structure_names)):
-            if i != j:
-                # When structure i is present, what's the accuracy for structure j?
-                mask_i_present = presence_targets[:, i] == 1
-                if mask_i_present.sum() > 0:
-                    j_accuracy_when_i_present = np.mean(
-                        (presence_preds[mask_i_present, j] > 0.5) == presence_targets[mask_i_present, j]
-                    )
-                    interaction_matrix[i, j] = j_accuracy_when_i_present
-
-    # Convert to dictionary format
-    interactions = {}
-    for i, struct_i in enumerate(evaluator.structure_names):
-        interactions[struct_i] = {}
-        for j, struct_j in enumerate(evaluator.structure_names):
-            if i != j:
-                interactions[struct_i][struct_j] = float(interaction_matrix[i, j])
-
-    return interactions
-
-
-def analyze_model_uncertainty(evaluator):
-    """Analyze model uncertainty patterns"""
-    uncertainty_metrics = {
-        'entropy_by_structure': {},
-        'uncertainty_vs_accuracy': {},
-        'high_uncertainty_cases': []
-    }
-
-    presence_preds = np.array(evaluator.results['presence_predictions'])
-    presence_targets = np.array(evaluator.results['presence_targets'])
+    # Analyze attention distribution for each structure
+    report_lines.append("ATTENTION DISTRIBUTION ANALYSIS:")
+    report_lines.append("-" * 40)
 
     for i, struct_name in enumerate(evaluator.structure_names):
-        probs = presence_preds[:, i]
-        targets = presence_targets[:, i]
+        # Calculate attention statistics for present structures only
+        present_mask = presence_targets[:, i] == 1
+        if present_mask.sum() == 0:
+            continue
 
-        # Calculate entropy (uncertainty)
-        entropies = -probs * np.log(probs + 1e-8) - (1 - probs) * np.log(1 - probs + 1e-8)
+        present_attention = attention_maps[present_mask, i]  # [N_present, D, H, W]
 
-        # Accuracy for each prediction
-        accuracies = ((probs > 0.5).astype(int) == targets).astype(float)
+        # Calculate statistics
+        mean_attention = np.mean(present_attention)
+        std_attention = np.std(present_attention)
+        max_attention = np.max(present_attention)
+        sparsity = (present_attention < 0.1).mean()  # Fraction of low attention values
 
-        uncertainty_metrics['entropy_by_structure'][struct_name] = {
-            'mean_entropy': float(np.mean(entropies)),
-            'std_entropy': float(np.std(entropies)),
-            'entropy_accuracy_correlation': float(np.corrcoef(entropies, accuracies)[0, 1])
-        }
+        report_lines.append(f"{struct_name}:")
+        report_lines.append(f"  Mean attention: {mean_attention:.4f}")
+        report_lines.append(f"  Std attention: {std_attention:.4f}")
+        report_lines.append(f"  Max attention: {max_attention:.4f}")
+        report_lines.append(f"  Sparsity (<0.1): {sparsity:.4f}")
+        report_lines.append("")
 
-        # Find high uncertainty cases
-        high_uncertainty_threshold = np.percentile(entropies, 90)
-        high_unc_indices = np.where(entropies > high_uncertainty_threshold)[0]
+    # Analyze position priors
+    report_lines.append("POSITION PRIORS ANALYSIS:")
+    report_lines.append("-" * 30)
 
-        for idx in high_unc_indices:
-            uncertainty_metrics['high_uncertainty_cases'].append({
-                'sample_idx': int(idx),
-                'structure': struct_name,
-                'entropy': float(entropies[idx]),
-                'probability': float(probs[idx]),
-                'true_label': int(targets[idx]),
-                'correct': bool(accuracies[idx])
-            })
+    for i, struct_name in enumerate(evaluator.structure_names):
+        prior = position_priors[0, i]  # Take first sample (priors are the same)
 
-    return uncertainty_metrics
+        mean_prior = np.mean(prior)
+        std_prior = np.std(prior)
+        min_prior = np.min(prior)
+        max_prior = np.max(prior)
+
+        report_lines.append(f"{struct_name}:")
+        report_lines.append(f"  Mean prior: {mean_prior:.4f}")
+        report_lines.append(f"  Std prior: {std_prior:.4f}")
+        report_lines.append(f"  Range: [{min_prior:.4f}, {max_prior:.4f}]")
+        report_lines.append("")
+
+    report_lines.append("=" * 60)
+
+    # Save report
+    with open(evaluator.output_dir / 'attention_analysis_report.txt', 'w') as f:
+        f.write('\n'.join(report_lines))
 
 
 def main():
     """Main testing function"""
-    parser = argparse.ArgumentParser(description='Enhanced Medical Model Testing with Advanced Visualizations')
+    parser = argparse.ArgumentParser(description='Comprehensive Medical Model Testing')
 
     parser.add_argument('--weights', '-w', type=str, required=True,
                         help='Path to model weights (.pth file)')
@@ -1637,7 +1372,7 @@ def main():
     parser.add_argument('--split', '-s', type=str, default='test',
                         choices=['train', 'val', 'test'],
                         help='Dataset split to evaluate on')
-    parser.add_argument('--output', '-o', type=str, default='./enhanced_test_results',
+    parser.add_argument('--output', '-o', type=str, default='./test_results',
                         help='Output directory for results')
     parser.add_argument('--batch-size', '-b', type=int, default=4,
                         help='Batch size for evaluation')
@@ -1648,10 +1383,6 @@ def main():
                         help='Device to use for inference')
     parser.add_argument('--num-workers', type=int, default=2,
                         help='Number of data loader workers')
-    parser.add_argument('--detailed-segmentation', action='store_true',
-                        help='Create detailed segmentation visualizations for all samples')
-    parser.add_argument('--skip-additional-tests', action='store_true',
-                        help='Skip additional specialized tests (faster execution)')
 
     args = parser.parse_args()
 
@@ -1672,7 +1403,7 @@ def main():
         raise FileNotFoundError(f"Dataset directory not found: {args.dataset}")
 
     print("=" * 80)
-    print("ENHANCED MEDICAL MODEL TESTING WITH ADVANCED VISUALIZATIONS")
+    print("COMPREHENSIVE MEDICAL MODEL TESTING")
     print("=" * 80)
     print(f"Weights file: {args.weights}")
     print(f"Dataset: {args.dataset}")
@@ -1680,8 +1411,6 @@ def main():
     print(f"Output directory: {args.output}")
     print(f"Batch size: {args.batch_size}")
     print(f"Device: {device}")
-    print(f"Detailed segmentation: {args.detailed_segmentation}")
-    print(f"Additional tests: {not args.skip_additional_tests}")
     print("")
 
     # Load dataset to get metadata
@@ -1728,7 +1457,7 @@ def main():
         return
 
     # Create evaluator
-    print(f"\nInitializing enhanced evaluator...")
+    print(f"\nInitializing evaluator...")
     evaluator = ModelEvaluator(model, device, structure_names, args.output)
 
     # Run evaluation
@@ -1760,25 +1489,22 @@ def main():
         return
 
     # Create visualizations
-    print("\nCreating enhanced visualizations...")
+    print("\nCreating visualizations...")
     try:
-        max_viz_samples = args.max_samples if not args.detailed_segmentation else len(evaluator.results['images'])
-        evaluator.create_visualizations(metrics, max_samples=max_viz_samples)
+        evaluator.create_visualizations(metrics, max_samples=args.max_samples)
         print("  Visualizations completed!")
     except Exception as e:
         print(f"Error creating visualizations: {e}")
         return
 
-    # Run additional specialized tests
-    if not args.skip_additional_tests:
-        try:
-            additional_results = create_additional_tests(evaluator, metrics)
-            print("  Additional tests completed!")
-        except Exception as e:
-            print(f"Error in additional tests: {e}")
-            additional_results = None
-    else:
-        additional_results = None
+    # Create attention analysis report
+    print("\nCreating attention analysis...")
+    try:
+        create_attention_analysis_report(evaluator)
+        print("  Attention analysis completed!")
+    except Exception as e:
+        print(f"Error creating attention analysis: {e}")
+        return
 
     # Save detailed results
     print("\nSaving detailed results...")
@@ -1789,23 +1515,13 @@ def main():
         print(f"Error saving results: {e}")
         return
 
-    # Print enhanced summary
+    # Print summary
     print("\n" + "=" * 80)
-    print("ENHANCED EVALUATION SUMMARY")
+    print("EVALUATION SUMMARY")
     print("=" * 80)
     print(f"Overall presence detection accuracy: {metrics['presence_overall_accuracy']:.4f}")
     print(f"Overall mean Dice score: {metrics['segmentation_overall']['mean_dice']:.4f}")
     print(f"Overall mean IoU score: {metrics['segmentation_overall']['mean_iou']:.4f}")
-
-    # Attention analysis summary
-    if 'attention_analysis' in metrics:
-        attention_metrics = metrics['attention_analysis']
-        avg_attention_dice = np.mean([attention_metrics[s]['attention_dice_mean']
-                                      for s in structure_names])
-        avg_attention_coverage = np.mean([attention_metrics[s]['attention_coverage_mean']
-                                          for s in structure_names])
-        print(f"Average attention quality (Dice): {avg_attention_dice:.4f}")
-        print(f"Average attention coverage: {avg_attention_coverage:.4f}")
 
     # Best and worst performing structures
     presence_f1_scores = {name: metrics['presence_per_structure'][name]['f1_score']
@@ -1816,116 +1532,23 @@ def main():
     print(f"\nBest performing structure: {best_structure} (F1: {presence_f1_scores[best_structure]:.4f})")
     print(f"Worst performing structure: {worst_structure} (F1: {presence_f1_scores[worst_structure]:.4f})")
 
-    # Additional test results summary
-    if additional_results:
-        print(f"\nAdditional Tests Summary:")
-        edge_cases = additional_results['edge_cases']
-        print(f"  High confidence errors: {len(edge_cases['high_confidence_errors'])}")
-        print(f"  Low confidence correct predictions: {len(edge_cases['low_confidence_correct'])}")
-        print(f"  Absent structures with high attention: {len(edge_cases['absent_with_high_attention'])}")
-
-        if additional_results['uncertainty_analysis']:
-            avg_entropy = np.mean([metrics['mean_entropy'] for metrics in
-                                   additional_results['uncertainty_analysis']['entropy_by_structure'].values()])
-            print(f"  Average prediction entropy: {avg_entropy:.4f}")
-
-    # Print model insights
-    print(f"\nModel Insights:")
-    if 'attention_analysis' in metrics:
-        # Find structures with best/worst attention quality
-        attention_dice_scores = {name: metrics['attention_analysis'][name]['attention_dice_mean']
-                                 for name in structure_names if metrics['attention_analysis'][name]['num_samples'] > 0}
-        if attention_dice_scores:
-            best_attention = max(attention_dice_scores, key=attention_dice_scores.get)
-            worst_attention = min(attention_dice_scores, key=attention_dice_scores.get)
-            print(f"  Best attention quality: {best_attention} (Dice: {attention_dice_scores[best_attention]:.4f})")
-            print(f"  Worst attention quality: {worst_attention} (Dice: {attention_dice_scores[worst_attention]:.4f})")
-
-    # Scenario complexity analysis
-    scenario_metrics = metrics['scenario_based']
-    complexity_accuracy = [
-        (scenario_metrics[scenario]['avg_structures_present'], scenario_metrics[scenario]['accuracy'])
-        for scenario in scenario_metrics.keys()]
-    if complexity_accuracy:
-        avg_complexity = np.mean([x[0] for x in complexity_accuracy])
-        if len(complexity_accuracy) > 1:
-            complexity_acc_corr = np.corrcoef([x[0] for x in complexity_accuracy],
-                                              [x[1] for x in complexity_accuracy])[0, 1]
-        else:
-            complexity_acc_corr = 0.0
-        print(f"  Average scenario complexity: {avg_complexity:.2f} structures")
-        print(f"  Complexity vs accuracy correlation: {complexity_acc_corr:.3f}")
-
     print(f"\nAll results saved to: {args.output}")
-    print("Generated files:")
-    print("=" * 50)
-    print("Core Analysis:")
-    print("  - evaluation_report.txt: Comprehensive text report")
+    print("Check the following files:")
+    print("  - evaluation_report.txt: Detailed text report")
+    print("  - attention_analysis_report.txt: Attention mechanism analysis")
     print("  - detailed_metrics.json: All metrics in JSON format")
-    print("  - predictions_data.json: Raw predictions for further analysis")
-    print("")
-    print("Visualizations:")
-    print("  - enhanced_sample_predictions_*.png: Enhanced sample visualizations")
-    print("  - attention_analysis.png: Attention map quality analysis")
-    print("  - structural_position_priors.png: Learned anatomical position priors")
-    if args.detailed_segmentation:
-        print("  - detailed_segmentation_sample_*.png: Individual segmentation overlays")
-    print("  - feature_response_analysis.png: Feature response patterns")
+    print("  - detailed_sample_*.png: Comprehensive sample analysis with attention maps")
+    print("  - attention_maps_overview.png: Attention maps across structures")
+    print("  - anatomical_priors.png: Learned anatomical position priors")
+    print("  - segmentation_comparison_*.png: True vs predicted segmentations")
+    print("  - sample_predictions_*.png: Individual sample visualizations")
     print("  - presence_detection_metrics.png: Presence detection performance")
     print("  - segmentation_metrics.png: Segmentation performance")
     print("  - scenario_analysis.png: Performance by scenario")
-    print("  - confidence_analysis.png: Model confidence and calibration")
+    print("  - confidence_analysis.png: Model confidence analysis")
     print("  - confusion_matrices.png: Confusion matrices for all structures")
     print("  - roc_pr_curves.png: ROC and Precision-Recall curves")
-    print("")
-    if not args.skip_additional_tests:
-        print("Advanced Analysis:")
-        print("  - additional_tests.json: Edge cases and specialized analysis")
-        print("")
-
-    print("Recommended Next Steps:")
-    print("-" * 30)
-
-    # Provide recommendations based on results
-    overall_performance = metrics['presence_overall_accuracy']
-    seg_performance = metrics['segmentation_overall']['mean_dice']
-
-    if overall_performance < 0.7:
-        print("• Overall presence detection accuracy is low (<70%)")
-        print("  - Review training data balance and augmentation")
-        print("  - Consider adjusting loss function weights")
-        print("  - Check attention_analysis.png for attention quality issues")
-
-    if seg_performance < 0.5:
-        print("• Segmentation performance is low (Dice <50%)")
-        print("  - Review structural_position_priors.png for anatomical learning")
-        print("  - Check feature_response_analysis.png for feature quality")
-        print("  - Consider multi-scale feature extraction")
-
-    if additional_results and len(additional_results['edge_cases']['high_confidence_errors']) > 10:
-        print("• Model shows overconfidence in many wrong predictions")
-        print("  - Implement better uncertainty quantification")
-        print("  - Review confidence_analysis.png for calibration issues")
-        print("  - Consider ensemble methods or temperature scaling")
-
-    if 'attention_analysis' in metrics:
-        attention_samples = [metrics['attention_analysis'][s]['num_samples']
-                             for s in structure_names if metrics['attention_analysis'][s]['num_samples'] > 0]
-        if attention_samples:
-            avg_att_dice = np.mean([metrics['attention_analysis'][s]['attention_dice_mean']
-                                    for s in structure_names if metrics['attention_analysis'][s]['num_samples'] > 0])
-            if avg_att_dice < 0.3:
-                print("• Attention maps poorly aligned with true structures")
-                print("  - Review attention supervision loss weights")
-                print("  - Check enhanced_sample_predictions_*.png for attention patterns")
-                print("  - Consider stronger anatomical constraints")
-
-    print("• Review detailed_metrics.json for structure-specific insights")
-    print("• Check scenario_analysis.png for performance patterns across different cases")
-
     print("\n" + "=" * 80)
-    print("Testing completed successfully!")
-    print("=" * 80)
 
 
 if __name__ == "__main__":
