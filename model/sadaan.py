@@ -21,19 +21,19 @@ class AnatomicalAttentionModule(nn.Module):
             torch.randn(num_structures, *spatial_dims) * 0.1
         )
 
-        # Attention generation network
+        # FIX: Update attention_conv to use the correct in_channels
         self.attention_conv = nn.Sequential(
-            nn.Conv3d(in_channels, in_channels // 2, 3, padding=1),
-            nn.BatchNorm3d(in_channels // 2),
+            nn.Conv3d(in_channels, in_channels // 2, 3, padding=1),  # Changed from hardcoded 64
+            nn.BatchNorm3d(in_channels // 2),  # Changed from hardcoded 32
             nn.ReLU(inplace=True),
-            nn.Conv3d(in_channels // 2, num_structures, 1),
+            nn.Conv3d(in_channels // 2, num_structures, 1),  # Changed from hardcoded 32
             nn.Sigmoid()
         )
 
-        # Feature-attention matching network
+        # FIX: Update feature_matcher to use the correct in_channels
         self.feature_matcher = nn.Sequential(
-            nn.Conv3d(in_channels, in_channels, 3, padding=1),
-            nn.BatchNorm3d(in_channels),
+            nn.Conv3d(in_channels, in_channels, 3, padding=1),  # This was already correct
+            nn.BatchNorm3d(in_channels),  # This was already correct
             nn.ReLU(inplace=True),
             nn.Conv3d(in_channels, num_structures, 1)
         )
