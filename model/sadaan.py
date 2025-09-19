@@ -280,35 +280,39 @@ class SpatialAttentionMedicalSegmenter(nn.Module):
     """Updated model with improved components"""
 
     def __init__(self, in_channels: int = 1, num_structures: int = 5,
-                 feature_channels: int = 256, spatial_dims: Tuple[int, int, int] = (64, 64, 64)):
+                 spatial_dims: Tuple[int, int, int] = (64, 64, 64)):
         super().__init__()
         self.num_structures = num_structures
 
         # Improved encoder
         self.encoder = Encoder(in_channels)
 
+        # Infer the encoder output channels from its final_conv
+        encoder_out_channels = self.encoder.final_conv.out_channels  # <-- 256
+
         self.attention_module = AnatomicalAttentionModule(
-            feature_channels, num_structures, spatial_dims
+            in_channels=encoder_out_channels,
+            num_structures=num_structures,
+            spatial_dims=spatial_dims
         )
 
-        self.absence_detector = AbsenceDetectionHead(num_structures, feature_channels)
+        self.absence_detector = AbsenceDetectionHead(
+            num_structures=num_structures,
+            feature_dim=encoder_out_channels
+        )
 
         # Improved segmentation head
-        self.segmentation_head = SegmentationHead(feature_channels, num_structures)
+        self.segmentation_head = SegmentationHead(
+            in_channels=encoder_out_channels,
+            num_structures=num_structures
+        )
 
     def forward(self, x: torch.Tensor, presence_threshold: float = 0.5) -> Dict[str, torch.Tensor]:
-        # Extract features with improved encoder
         features = self.encoder(x)
-
-        # Generate attention maps
         attention_outputs = self.attention_module(features)
-
-        # Predict structure presence/absence
         absence_outputs = self.absence_detector(features, attention_outputs)
-
-        # Improved conditional segmentation
         segmentation_outputs = self.segmentation_head(
-            features, attention_outputs, absence_outputs['presence_probs'], presence_threshold
+            features, attention_outputs['attention_maps']
         )
 
         return {

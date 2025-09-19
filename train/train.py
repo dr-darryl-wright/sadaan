@@ -38,11 +38,14 @@ def config():
     """Sacred configuration"""
     dataset_path = './synthetic_medical_dataset'
     config_path = None
+
     model = {
-        'in_channels': 1,
-        'feature_channels': 64,
-        'presence_threshold': 0.5
+        'in_channels': 1,             # CT/MRI grayscale input
+        'num_structures': 5,          # number of anatomical classes
+        'presence_threshold': 0.5     # threshold for absence detection
+        # ⚠️ no feature_channels here — encoder decides output channels
     }
+
     training = {
         'batch_size': 4,
         'learning_rate': 5e-4,
@@ -56,6 +59,7 @@ def config():
         'memory_cleanup_frequency': 5,
         'max_history_length': 50
     }
+
     loss_weights = {
         'segmentation': 1.0,
         'dice': 2.0,
@@ -64,6 +68,7 @@ def config():
         'attention_supervision': 0.5,
         'confidence': 0.1
     }
+
     augmentation = {
         'noise_std': 2.0,
         'intensity_scale_range': [0.95, 1.05],
@@ -71,6 +76,7 @@ def config():
         'rotation_degrees': 5,
         'flip_probability': 0.3
     }
+
     optimizer = {
         'type': 'adamw',
         'weight_decay': 1e-4,
@@ -80,16 +86,19 @@ def config():
         'lr_factor': 0.5,
         'lr_patience': 10
     }
+
     checkpoint = {
         'save_dir': './checkpoints',
         'save_frequency': 10,
         'keep_best_only': False
     }
+
     logging = {
         'log_frequency': 1,
         'visualize_predictions': True,
         'num_visualization_samples': 3
     }
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     seed = 42
 
