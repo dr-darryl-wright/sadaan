@@ -250,9 +250,6 @@ class SpatialAttentionMedicalSegmenter(nn.Module):
         # Improved encoder
         self.encoder = Encoder(in_channels)
 
-        # Keep existing attention and absence detection modules
-        from __main__ import AnatomicalAttentionModule, AbsenceDetectionHead
-
         self.attention_module = AnatomicalAttentionModule(
             feature_channels, num_structures, spatial_dims
         )
