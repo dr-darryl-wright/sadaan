@@ -243,10 +243,9 @@ class SpatialAttentionMedicalSegmenter(nn.Module):
     """Updated model with improved components"""
 
     def __init__(self, in_channels: int = 1, num_structures: int = 5,
-                 spatial_dims: Tuple[int, int, int] = (64, 64, 64)):
+                 feature_channels: int = 256, spatial_dims: Tuple[int, int, int] = (64, 64, 64)):
         super().__init__()
         self.num_structures = num_structures
-        feature_channels = 256
 
         # Improved encoder
         self.encoder = Encoder(in_channels)
