@@ -159,46 +159,6 @@ class DatasetLoader:
                     f"    Scenarios: {dict(list(scenario_counts.items())[:5])}{'...' if len(scenario_counts) > 5 else ''}")
 
 
-class SyntheticMedicalDataset(Dataset):
-    """PyTorch Dataset wrapper for pre-loaded synthetic medical data"""
-
-    def __init__(self, data_dict: Dict, transform=None):
-        self.images = data_dict['images']
-        self.masks = data_dict['masks']
-        self.presence_labels = data_dict['presence_labels']
-        self.scenarios = data_dict['scenarios']
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.images)
-
-    def __getitem__(self, idx):
-        # Get data
-        image = self.images[idx]
-        masks = self.masks[idx]
-        presence = self.presence_labels[idx]
-        scenario = self.scenarios[idx]
-
-        # Convert to tensors
-        image = torch.from_numpy(image).float()
-        masks = torch.from_numpy(masks).float()
-        presence = torch.from_numpy(presence).long()
-
-        # Add channel dimension
-        image = image.unsqueeze(0)
-
-        # Apply transforms if any
-        if self.transform:
-            image = self.transform(image)
-
-        return {
-            'image': image,
-            'masks': masks,
-            'presence_labels': presence,
-            'scenario': scenario,
-            'index': idx
-        }
-
 
 class AugmentationTransform:
     """Simple augmentation transforms for medical images"""

@@ -21,19 +21,19 @@ class AnatomicalAttentionModule(nn.Module):
             torch.randn(num_structures, *spatial_dims) * 0.1
         )
 
-        # FIX: Update attention_conv to use the correct in_channels
+        # ✅ Attention conv: all based on in_channels, no hardcoding
         self.attention_conv = nn.Sequential(
-            nn.Conv3d(in_channels, in_channels // 2, 3, padding=1),  # Changed from hardcoded 64
-            nn.BatchNorm3d(in_channels // 2),  # Changed from hardcoded 32
+            nn.Conv3d(in_channels, in_channels // 2, 3, padding=1),
+            nn.BatchNorm3d(in_channels // 2),
             nn.ReLU(inplace=True),
-            nn.Conv3d(in_channels // 2, num_structures, 1),  # Changed from hardcoded 32
+            nn.Conv3d(in_channels // 2, num_structures, 1),
             nn.Sigmoid()
         )
 
-        # FIX: Update feature_matcher to use the correct in_channels
+        # ✅ Feature matcher: also fully dynamic
         self.feature_matcher = nn.Sequential(
-            nn.Conv3d(in_channels, in_channels, 3, padding=1),  # This was already correct
-            nn.BatchNorm3d(in_channels),  # This was already correct
+            nn.Conv3d(in_channels, in_channels, 3, padding=1),
+            nn.BatchNorm3d(in_channels),
             nn.ReLU(inplace=True),
             nn.Conv3d(in_channels, num_structures, 1)
         )
@@ -52,7 +52,10 @@ class AnatomicalAttentionModule(nn.Module):
         feature_responses = self.feature_matcher(features)  # [B, num_structures, D, H, W]
 
         # Compute attention-feature alignment for absence detection
-        alignment_scores = torch.mean(enhanced_attention * torch.sigmoid(feature_responses), dim=(2, 3, 4))
+        alignment_scores = torch.mean(
+            enhanced_attention * torch.sigmoid(feature_responses),
+            dim=(2, 3, 4)
+        )
 
         return {
             'attention_maps': enhanced_attention,
@@ -67,14 +70,14 @@ class AbsenceDetectionHead(nn.Module):
     Determines structure presence/absence based on attention-feature alignment.
     """
 
-    def __init__(self, num_structures: int, feature_dim: int = 256):
+    def __init__(self, num_structures: int, feature_dim: int):
         super().__init__()
         self.num_structures = num_structures
 
         # Global feature aggregation
         self.global_pool = nn.AdaptiveAvgPool3d(1)
 
-        # Per-structure absence detection
+        # Per-structure absence detection classifiers
         self.absence_classifiers = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(feature_dim + 1, 64),  # +1 for alignment score
@@ -105,7 +108,6 @@ class AbsenceDetectionHead(nn.Module):
 
         absence_logits = []
         for i in range(self.num_structures):
-            # Combine global features with structure-specific alignment score
             struct_input = torch.cat([global_features, alignment_scores[:, i:i + 1]], dim=1)
             struct_logits = self.absence_classifiers[i](struct_input)
             absence_logits.append(struct_logits)
@@ -193,49 +195,84 @@ class Encoder(nn.Module):
 
 
 class SegmentationHead(nn.Module):
-    """Improved segmentation head with better conditional logic"""
+    """
+    Produces per-structure segmentation probability maps
+    using attention-modulated features.
+    """
 
     def __init__(self, in_channels: int, num_structures: int):
         super().__init__()
+        self.in_channels = in_channels
         self.num_structures = num_structures
 
-        self.segmentation_conv = nn.Sequential(
+        # Feature refinement
+        self.feature_refine = nn.Sequential(
             nn.Conv3d(in_channels, in_channels // 2, 3, padding=1),
             nn.BatchNorm3d(in_channels // 2),
             nn.ReLU(inplace=True),
-            nn.Conv3d(in_channels // 2, in_channels // 4, 3, padding=1),
-            nn.BatchNorm3d(in_channels // 4),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(in_channels // 4, num_structures, 1)
+            nn.Conv3d(in_channels // 2, in_channels // 2, 3, padding=1),
+            nn.BatchNorm3d(in_channels // 2),
+            nn.ReLU(inplace=True)
         )
 
-    def forward(self, features: torch.Tensor, attention_outputs: Dict[str, torch.Tensor],
-                presence_probs: torch.Tensor, threshold: float = 0.5) -> Dict[str, torch.Tensor]:
-        # Generate raw segmentation logits
-        raw_logits = self.segmentation_conv(features)  # [B, num_structures, D, H, W]
+        # Final segmentation layer
+        self.segmentation_layer = nn.Conv3d(in_channels // 2, num_structures, 1)
 
-        # Apply attention gating
-        attention_maps = attention_outputs['attention_maps']
-        attention_gated = raw_logits * attention_maps
+    def forward(self, features: torch.Tensor, attention_maps: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            features: [B, C, D, H, W] feature tensor
+            attention_maps: [B, num_structures, D, H, W] attention maps
 
-        # IMPROVED: Apply presence-based suppression more carefully
-        # Create smooth gating instead of hard thresholding
-        presence_gates = torch.sigmoid(10 * (presence_probs - threshold))  # Smooth step function
-        presence_gates = presence_gates.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        Returns:
+            dict with segmentation probabilities and logits
+        """
+        # Refine features
+        refined_features = self.feature_refine(features)  # [B, C/2, D, H, W]
 
-        # Apply presence gating
-        conditional_logits = attention_gated * presence_gates
+        # Broadcast attention to match refined features channels
+        attn_expanded = F.interpolate(
+            attention_maps,
+            size=refined_features.shape[2:],  # match D, H, W
+            mode='trilinear',
+            align_corners=False
+        )  # [B, num_structures, D, H, W]
 
-        # For absent structures, actively suppress with negative bias
-        absent_mask = (presence_probs < threshold).float()
-        absent_bias = -10.0 * absent_mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-        conditional_logits = conditional_logits + absent_bias
+        # Apply attention modulation
+        # Expand refined features across structures
+        refined_expanded = refined_features.unsqueeze(1).repeat(1, self.num_structures, 1, 1, 1, 1)
+        refined_expanded = refined_expanded.view(
+            refined_features.size(0) * self.num_structures,
+            refined_features.size(1),
+            *refined_features.shape[2:]
+        )
+        attn_flat = attn_expanded.view(
+            refined_features.size(0) * self.num_structures,
+            1,
+            *refined_features.shape[2:]
+        )
+
+        modulated_features = refined_expanded * attn_flat  # [B*num_structures, C/2, D, H, W]
+
+        # Segmentation logits
+        logits = self.segmentation_layer(modulated_features)  # [B*num_structures, num_structures, D, H, W]
+
+        # Reshape back
+        logits = logits.view(
+            refined_features.size(0),
+            self.num_structures,
+            self.num_structures,
+            *refined_features.shape[2:]
+        )
+
+        # We only need diagonal (structure-specific output)
+        logits = logits[:, range(self.num_structures), range(self.num_structures)]  # [B, num_structures, D, H, W]
+
+        probs = torch.sigmoid(logits)
 
         return {
-            'segmentation_logits': conditional_logits,
-            'segmentation_probs': torch.sigmoid(conditional_logits),
-            'raw_logits': raw_logits,
-            'attention_gated': attention_gated
+            'segmentation_logits': logits,
+            'segmentation_probs': probs
         }
 
 
