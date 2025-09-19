@@ -22,7 +22,7 @@ except ImportError:
     NEPTUNE_AVAILABLE = False
 
 # Sacred experiment setup
-ex = Experiment('sadaan')
+ex = Experiment('sadaan_hdf5')
 ex.observers.append(MongoObserver(url='localhost:27017', db_name='sadaan'))
 
 # Import your previous implementations
@@ -101,6 +101,79 @@ def config():
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     seed = 42
+
+
+class HDF5MedicalDataset(torch.utils.data.Dataset):
+    """PyTorch Dataset that loads samples on-demand from HDF5"""
+
+    def __init__(self, data_path: str, split: str = 'train', transform=None):
+        """
+        Args:
+            data_path: Path to the HDF5 dataset directory
+            split: Dataset split ('train', 'val', 'test')
+            transform: Optional transform function
+        """
+        self.data_path = Path(data_path)
+        self.split = split
+        self.transform = transform
+
+        # Load metadata
+        with open(self.data_path / 'metadata.json', 'r') as f:
+            self.metadata = json.load(f)
+
+        self.structure_names = self.metadata['structure_names']
+        self.image_size = self.metadata['image_size']
+
+        # Open HDF5 file
+        self.hdf5_path = self.data_path / f'{self.split}.h5'
+        if not self.hdf5_path.exists():
+            raise FileNotFoundError(f"HDF5 file not found: {self.hdf5_path}")
+
+        # Open file and get basic info
+        self.hdf5_file = h5py.File(self.hdf5_path, 'r')
+        self.n_samples = self.hdf5_file.attrs['n_samples']
+
+        # Preload scenarios for faster access
+        self.scenarios = [s.decode('utf-8') if isinstance(s, bytes) else s
+                          for s in self.hdf5_file['scenarios'][:]]
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        if idx >= self.n_samples:
+            raise IndexError(f"Index {idx} out of range for dataset of size {self.n_samples}")
+
+        # Load image and labels
+        image = self.hdf5_file['images'][idx]
+        masks = self.hdf5_file['masks'][idx]
+        presence_labels = self.hdf5_file['presence_labels'][idx]
+        scenario = self.scenarios[idx]
+
+        # Apply transforms if specified
+        if self.transform:
+            image = self.transform(image)
+
+        # Convert to torch tensors
+        image = torch.from_numpy(image.astype(np.float32))
+        masks = torch.from_numpy(masks.astype(np.float32))
+        presence_labels = torch.from_numpy(presence_labels.astype(np.int64))
+
+        # Add channel dimension to image
+        image = image.unsqueeze(0)  # [1, H, W, D]
+
+        return {
+            'image': image,
+            'masks': masks,
+            'presence_labels': presence_labels,
+            'scenario': scenario,
+            'index': idx
+        }
+
+    def __del__(self):
+        """Clean up HDF5 file handle"""
+        if hasattr(self, 'hdf5_file'):
+            self.hdf5_file.close()
 
 
 class DatasetLoader:
@@ -314,16 +387,25 @@ def create_model(model, structure_names, image_size, device):
 
 @ex.capture
 def create_data_loaders(dataset_path, training, augmentation):
-    """Load datasets and create data loaders"""
-    loader = DatasetLoader(dataset_path)
-    loader.print_dataset_info()
+    """Load HDF5 datasets and create data loaders"""
 
-    structure_names = loader.get_structure_names()
-    image_size = loader.get_image_size()
+    # Check if dataset exists
+    dataset_path = Path(dataset_path)
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"Dataset not found at {dataset_path}")
 
-    train_data = loader.load_split('train')
-    val_data = loader.load_split('val')
+    # Load metadata
+    with open(dataset_path / 'metadata.json', 'r') as f:
+        metadata = json.load(f)
 
+    structure_names = metadata['structure_names']
+    image_size = metadata['image_size']
+
+    print(f"Loading HDF5 dataset from {dataset_path}")
+    print(f"Structures: {structure_names}")
+    print(f"Image size: {image_size}")
+
+    # Create transforms
     train_transform = None
     if augmentation['enabled']:
         train_transform = AugmentationTransform(
@@ -331,9 +413,14 @@ def create_data_loaders(dataset_path, training, augmentation):
             intensity_scale_range=tuple(augmentation['intensity_scale_range'])
         )
 
-    train_dataset = SyntheticMedicalDataset(train_data, transform=train_transform)
-    val_dataset = SyntheticMedicalDataset(val_data)
+    # Create datasets
+    train_dataset = HDF5MedicalDataset(dataset_path, split='train', transform=train_transform)
+    val_dataset = HDF5MedicalDataset(dataset_path, split='val')
 
+    print(f"Train samples: {len(train_dataset)}")
+    print(f"Val samples: {len(val_dataset)}")
+
+    # Create data loaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=training['batch_size'],
@@ -354,6 +441,7 @@ def create_data_loaders(dataset_path, training, augmentation):
         drop_last=False
     )
 
+    # Log dataset info to Sacred
     ex.log_scalar('data.train_samples', len(train_dataset))
     ex.log_scalar('data.val_samples', len(val_dataset))
     ex.log_scalar('data.num_structures', len(structure_names))
