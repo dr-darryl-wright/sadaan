@@ -858,7 +858,7 @@ def example_training_loop():
 # Example usage and test
 if __name__ == "__main__":
     # Create dataset generator
-    generator = SyntheticDatasetGenerator(image_size=(128, 128, 64))
+    generator = SyntheticDatasetGenerator(image_size=(64, 64, 32))
 
     # Generate dataset
     print("Generating synthetic dataset...")
