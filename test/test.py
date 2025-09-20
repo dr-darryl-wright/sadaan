@@ -1143,7 +1143,6 @@ def load_model_from_checkpoint(checkpoint_path, structure_names, image_size, dev
     model = SpatialAttentionMedicalSegmenter(
         in_channels=1,
         num_structures=len(structure_names),
-        feature_channels=64,
         spatial_dims=image_size
     )
 
