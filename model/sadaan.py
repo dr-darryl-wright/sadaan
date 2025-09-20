@@ -131,27 +131,27 @@ class Encoder(nn.Module):
         super().__init__()
 
         # Encoder path
-        self.enc1 = self._conv_block(in_channels, 32)
-        self.enc2 = self._conv_block(32, 64)
-        self.enc3 = self._conv_block(64, 128)
-        self.enc4 = self._conv_block(128, 256)
-        self.enc5 = self._conv_block(256, 512)
+        self.enc1 = self._conv_block(in_channels, 16)
+        self.enc2 = self._conv_block(16, 32)
+        self.enc3 = self._conv_block(32, 64)
+        self.enc4 = self._conv_block(64, 128)
+        self.enc5 = self._conv_block(128, 256)
 
         # Decoder path
-        self.up4 = nn.ConvTranspose3d(512, 256, 2, stride=2)
-        self.dec4 = self._conv_block(512, 256)  # 256 + 256 from skip
+        self.up4 = nn.ConvTranspose3d(256, 128, 2, stride=2)
+        self.dec4 = self._conv_block(256, 128)  # 256 + 256 from skip
 
-        self.up3 = nn.ConvTranspose3d(256, 128, 2, stride=2)
-        self.dec3 = self._conv_block(256, 128)  # 128 + 128 from skip
+        self.up3 = nn.ConvTranspose3d(128, 64, 2, stride=2)
+        self.dec3 = self._conv_block(128, 64)  # 128 + 128 from skip
 
-        self.up2 = nn.ConvTranspose3d(128, 64, 2, stride=2)
-        self.dec2 = self._conv_block(128, 64)  # 64 + 64 from skip
+        self.up2 = nn.ConvTranspose3d(64, 32, 2, stride=2)
+        self.dec2 = self._conv_block(64, 32)  # 64 + 64 from skip
 
-        self.up1 = nn.ConvTranspose3d(64, 32, 2, stride=2)
-        self.dec1 = self._conv_block(64, 32)  # 32 + 32 from skip
+        self.up1 = nn.ConvTranspose3d(32, 16, 2, stride=2)
+        self.dec1 = self._conv_block(32, 16)  # 32 + 32 from skip
 
         # Final feature layer
-        self.final_conv = nn.Conv3d(32, 256, 1)
+        self.final_conv = nn.Conv3d(16, 128, 1)
 
         self.pool = nn.MaxPool3d(2)
 
