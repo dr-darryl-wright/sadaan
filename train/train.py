@@ -36,7 +36,6 @@ def config():
     # Model parameters
     model = {
         'in_channels': 1,
-        'feature_channels': 64,
         'presence_threshold': 0.5
     }
 
@@ -303,7 +302,6 @@ def create_model(model, structure_names, image_size, device):
     model = SpatialAttentionMedicalSegmenter(
         in_channels=model['in_channels'],
         num_structures=len(structure_names),
-        feature_channels=model['feature_channels'],
         spatial_dims=image_size
     )
     model = model.to(device)
