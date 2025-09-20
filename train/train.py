@@ -61,6 +61,7 @@ def config():
         'focal_seg': 1.0,
         'absence': 1.0,
         'attention_supervision': 0.5,
+        'false_positive_suppression': 0.5,
         'confidence': 0.1
     }
 
