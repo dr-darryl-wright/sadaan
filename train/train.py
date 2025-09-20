@@ -42,6 +42,7 @@ def config():
     # Training parameters
     training = {
         'batch_size': 4,
+        'image_size': [128, 128, 64],
         'learning_rate': 5e-4,
         'num_epochs': 100,
         'early_stopping_patience': 20,
@@ -741,7 +742,7 @@ class Trainer:
 
 
 @ex.automain
-def main(dataset_path, device, seed, logging):
+def main(dataset_path, device, seed, logging, training):
     """Main training pipeline"""
 
     # Set random seeds
@@ -756,11 +757,11 @@ def main(dataset_path, device, seed, logging):
 
     # Load datasets
     print("Loading datasets...")
-    train_loader, val_loader, structure_names, image_size = create_data_loaders()
+    train_loader, val_loader, structure_names, _ = create_data_loaders()
 
     # Create model
     print("Creating model...")
-    model = create_model(structure_names=structure_names, image_size=image_size, device=device)
+    model = create_model(structure_names=structure_names, image_size=training['image_size'], device=device)
 
     # Create trainer
     trainer = Trainer(
