@@ -1,0 +1,84 @@
+================================================================================
+MEMORY-EFFICIENT MODEL EVALUATION REPORT
+================================================================================
+
+Total test samples processed: 101
+Number of anatomical structures: 13
+Overall presence detection accuracy: 0.9688
+Overall mean Dice score: 0.8462
+Overall mean IoU score: 0.7823
+
+PRESENCE DETECTION PERFORMANCE BY STRUCTURE:
+------------------------------------------------------------
+Structure       Accuracy   F1       Support 
+------------------------------------------------------------
+left_lung       0.9901     0.9937   79      
+right_lung      0.9802     0.9885   86      
+heart           1.0000     1.0000   92      
+liver           1.0000     1.0000   92      
+spleen          0.9505     0.9669   74      
+pancreas        0.9901     0.9939   82      
+left_kidney     0.8614     0.8986   73      
+right_kidney    0.8713     0.9172   80      
+L1              1.0000     1.0000   80      
+L2              0.9901     0.9935   77      
+L3              0.9901     0.9938   80      
+L4              0.9703     0.9809   77      
+L5              1.0000     1.0000   80      
+
+SEGMENTATION PERFORMANCE BY STRUCTURE:
+--------------------------------------------------
+Structure       Mean Dice    Mean IoU     Samples 
+--------------------------------------------------
+left_lung       0.9812       0.9631       79      
+right_lung      0.9796       0.9607       86      
+heart           0.9616       0.9272       92      
+liver           0.9797       0.9606       92      
+spleen          0.8893       0.8172       74      
+pancreas        0.7971       0.6828       82      
+left_kidney     0.8822       0.8021       73      
+right_kidney    0.8424       0.7498       80      
+L1              0.8112       0.7605       80      
+L2              0.6815       0.5924       77      
+L3              0.6515       0.5591       80      
+L4              0.7132       0.6259       77      
+L5              0.8300       0.7690       80      
+
+PERFORMANCE BY SCENARIO:
+------------------------------------------------------------
+Scenario                  Accuracy   Samples 
+------------------------------------------------------------
+bilateral_lung_resection  0.3333     3       
+bilateral_nephrectomy     0.0000     1       
+complex_abdominal_surger  0.8000     5       
+extensive_resection       1.0000     2       
+left_lung_resection       1.0000     5       
+left_nephrectomy          0.6250     8       
+minimal_structures        1.0000     3       
+missing_L2_L3             0.0000     3       
+missing_L4                0.0000     3       
+normal_abdominal          1.0000     9       
+normal_complete           0.6765     34      
+normal_thoracic           1.0000     9       
+right_nephrectomy         0.5000     8       
+splenectomy               0.5000     8       
+
+ATTENTION MECHANISM ANALYSIS (First 5 samples):
+--------------------------------------------------
+Structure       Mean Attn    Attn Std    
+--------------------------------------------------
+left_lung       0.0880       0.0572      
+right_lung      0.0912       0.0629      
+heart           0.0944       0.0484      
+liver           0.0926       0.0741      
+spleen          0.1034       0.0535      
+pancreas        0.1025       0.0585      
+left_kidney     0.1041       0.0541      
+right_kidney    0.1060       0.0677      
+L1              0.1033       0.0566      
+L2              0.1036       0.0578      
+L3              0.1014       0.0556      
+L4              0.1043       0.0533      
+L5              0.0997       0.0551      
+
+================================================================================
