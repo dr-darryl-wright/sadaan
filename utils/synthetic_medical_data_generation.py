@@ -9,6 +9,10 @@ from dataclasses import dataclass
 from sklearn.model_selection import train_test_split
 import torch
 from torch.utils.data import Dataset, DataLoader
+import argparse
+import sys
+from pathlib import Path
+
 
 
 @dataclass
@@ -856,94 +860,286 @@ def example_training_loop():
 
 
 # Example usage and test
-if __name__ == "__main__":
-    # Create dataset generator
-    generator = SyntheticDatasetGenerator(image_size=(128, 128, 64))
+import argparse
+import sys
+from pathlib import Path
 
-    # Generate dataset
-    print("Generating synthetic dataset...")
-    dataset = generator.generate_dataset(
-        total_samples=1000,  # You can increase this for real training
-        validation_split=0.2,
-        test_split=0.1,
-        position_noise=0.05,
-        size_noise=0.2,
-        intensity_noise=0.15
+
+def parse_image_size(size_str):
+    """Parse image size string like '128,128,64' into tuple"""
+    try:
+        parts = size_str.split(',')
+        if len(parts) != 3:
+            raise ValueError("Image size must have exactly 3 dimensions")
+        return tuple(int(x) for x in parts)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"Invalid image size '{size_str}': {e}")
+
+
+def main():
+    """Main function with command line argument parsing"""
+    parser = argparse.ArgumentParser(
+        description='Generate synthetic medical dataset for testing AI models',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
-    # Print dataset statistics
-    print("\nDataset Statistics:")
-    for split in ['train', 'val', 'test']:
-        if split in dataset:
-            n_samples = len(dataset[split]['images'])
-            print(f"  {split}: {n_samples} samples")
+    # Dataset parameters
+    parser.add_argument(
+        '--image-size',
+        type=parse_image_size,
+        default=(128, 128, 64),
+        help='Image dimensions as Z,Y,X (e.g., "128,128,64")'
+    )
 
-            # Count scenarios
-            scenarios = dataset[split]['scenarios']
-            from collections import Counter
+    parser.add_argument(
+        '--total-samples',
+        type=int,
+        default=1000,
+        help='Total number of samples to generate'
+    )
 
-            scenario_counts = Counter(scenarios)
-            print(f"    Scenarios: {dict(scenario_counts)}")
+    parser.add_argument(
+        '--validation-split',
+        type=float,
+        default=0.2,
+        help='Fraction of data for validation (0.0-1.0)'
+    )
 
-            # Presence statistics
-            presence = dataset[split]['presence_labels']
-            presence_rates = presence.mean(axis=0)
-            print(f"    Presence rates: {dict(zip(dataset['structure_names'], presence_rates))}")
-            print()
+    parser.add_argument(
+        '--test-split',
+        type=float,
+        default=0.1,
+        help='Fraction of data for testing (0.0-1.0)'
+    )
 
-    # Save dataset in HDF5 format
-    print("Saving dataset in HDF5 format...")
-    generator.save_dataset_hdf5(dataset, '../data/synthetic_medical_dataset_hdf5')
-    print("Dataset saved!")
+    parser.add_argument(
+        '--output-dir',
+        type=str,
+        default='../data/synthetic_medical_dataset_hdf5',
+        help='Output directory for the generated dataset'
+    )
 
-    # Test the lazy loading
-    print("\nTesting lazy loading...")
+    # Noise parameters
+    parser.add_argument(
+        '--position-noise',
+        type=float,
+        default=0.05,
+        help='Standard deviation for position noise (0.0-0.2)'
+    )
 
-    try:
-        # Create lazy dataset
-        lazy_dataset = LazyMedicalDataset(
-            '../data/synthetic_medical_dataset_hdf5',
-            split='train',
-            load_masks=True,
-            preload_metadata=True
+    parser.add_argument(
+        '--size-noise',
+        type=float,
+        default=0.2,
+        help='Standard deviation for size variation (0.0-0.5)'
+    )
+
+    parser.add_argument(
+        '--intensity-noise',
+        type=float,
+        default=0.15,
+        help='Standard deviation for intensity variation (0.0-0.3)'
+    )
+
+    # Control options
+    parser.add_argument(
+        '--skip-generation',
+        action='store_true',
+        help='Skip dataset generation (useful for testing loading only)'
+    )
+
+    parser.add_argument(
+        '--skip-visualization',
+        action='store_true',
+        help='Skip sample visualization'
+    )
+
+    parser.add_argument(
+        '--skip-training-test',
+        action='store_true',
+        help='Skip training loop test'
+    )
+
+    parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Enable verbose output'
+    )
+
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=42,
+        help='Random seed for reproducibility'
+    )
+
+    args = parser.parse_args()
+
+    # Validate arguments
+    if args.validation_split + args.test_split >= 1.0:
+        print("Error: validation_split + test_split must be < 1.0")
+        sys.exit(1)
+
+    if args.total_samples <= 0:
+        print("Error: total_samples must be positive")
+        sys.exit(1)
+
+    # Set random seed for reproducibility
+    np.random.seed(args.seed)
+
+    print(f"Synthetic Medical Dataset Generator")
+    print(f"Image size: {args.image_size}")
+    print(f"Total samples: {args.total_samples}")
+    print(f"Validation split: {args.validation_split}")
+    print(f"Test split: {args.test_split}")
+    print(f"Output directory: {args.output_dir}")
+    print(f"Random seed: {args.seed}")
+    print("-" * 50)
+
+    if not args.skip_generation:
+        # Create dataset generator
+        print("Initializing dataset generator...")
+        generator = SyntheticDatasetGenerator(image_size=args.image_size)
+
+        if args.verbose:
+            print(f"Available anatomical structures: {list(generator.generator.anatomy_templates.keys())}")
+            print(f"Number of test scenarios: {len(generator.scenarios)}")
+
+        # Generate dataset
+        print("Generating synthetic dataset...")
+        dataset = generator.generate_dataset(
+            total_samples=args.total_samples,
+            validation_split=args.validation_split,
+            test_split=args.test_split,
+            position_noise=args.position_noise,
+            size_noise=args.size_noise,
+            intensity_noise=args.intensity_noise
         )
 
-        print(f"Lazy dataset created with {len(lazy_dataset)} samples")
+        # Print dataset statistics
+        print("\nDataset Statistics:")
+        for split in ['train', 'val', 'test']:
+            if split in dataset:
+                n_samples = len(dataset[split]['images'])
+                print(f"  {split}: {n_samples} samples")
 
-        # Test loading a few samples
-        print("Testing sample loading...")
-        for i in [0, 10, 50]:
-            if i < len(lazy_dataset):
-                sample = lazy_dataset[i]
-                print(f"  Sample {i}: scenario={sample['scenario']}, "
-                      f"image_shape={sample['image'].shape}, "
-                      f"n_present_structures={sample['presence_labels'].sum().item()}")
+                if args.verbose:
+                    # Count scenarios
+                    scenarios = dataset[split]['scenarios']
+                    from collections import Counter
+                    scenario_counts = Counter(scenarios)
+                    print(f"    Top scenarios: {dict(list(scenario_counts.most_common(5)))}")
 
-        # Visualize some samples
-        print("\nVisualizing samples...")
+                    # Presence statistics
+                    presence = dataset[split]['presence_labels']
+                    presence_rates = presence.mean(axis=0)
+                    present_structures = [name for name, rate in zip(dataset['structure_names'], presence_rates) if
+                                          rate > 0.5]
+                    print(f"    Most common structures: {present_structures[:5]}")
 
-        # Find a normal case
-        for i in range(min(20, len(lazy_dataset))):
-            sample = lazy_dataset[i]
-            if 'normal' in sample['scenario']:
-                print(f"Visualizing normal case: {sample['scenario']}")
-                visualize_sample(lazy_dataset, i)
-                break
+        # Save dataset in HDF5 format
+        print(f"\nSaving dataset to {args.output_dir}...")
+        generator.save_dataset_hdf5(dataset, args.output_dir)
+        print("Dataset saved successfully!")
 
-        # Find an abnormal case
-        for i in range(min(50, len(lazy_dataset))):
-            sample = lazy_dataset[i]
-            if 'nephrectomy' in sample['scenario']:
-                print(f"Visualizing abnormal case: {sample['scenario']}")
-                visualize_sample(lazy_dataset, i)
-                break
+        # Memory usage info
+        if args.verbose:
+            total_size_gb = (dataset['train']['images'].nbytes +
+                             dataset['val']['images'].nbytes +
+                             (dataset['test']['images'].nbytes if 'test' in dataset else 0)) / (1024 ** 3)
+            print(f"Total dataset size: {total_size_gb:.2f} GB")
 
-        # Test the training loop
-        print("\nTesting training loop...")
-        example_training_loop()
+    else:
+        print("Skipping dataset generation...")
 
-    except FileNotFoundError as e:
-        print(f"Could not test lazy loading: {e}")
-        print("Make sure to run the dataset generation first!")
+    # Test the lazy loading
+    if Path(args.output_dir).exists():
+        print("\nTesting lazy loading...")
 
-    print("\nScript completed successfully!")
+        try:
+            # Create lazy dataset
+            lazy_dataset = LazyMedicalDataset(
+                args.output_dir,
+                split='train',
+                load_masks=True,
+                preload_metadata=True
+            )
+
+            print(f"Lazy dataset loaded with {len(lazy_dataset)} samples")
+
+            if args.verbose:
+                # Print class distribution
+                print("\nClass Distribution (Training):")
+                distribution = lazy_dataset.get_class_distribution()
+                for struct_name, stats in distribution.items():
+                    print(f"  {struct_name}: {stats['presence_rate']:.1%} present "
+                          f"({stats['present']}/{len(lazy_dataset)})")
+
+            # Test loading a few samples
+            print("\nTesting sample loading...")
+            test_indices = [0, len(lazy_dataset) // 4, len(lazy_dataset) // 2]
+            for i in test_indices:
+                if i < len(lazy_dataset):
+                    sample = lazy_dataset[i]
+                    print(f"  Sample {i}: scenario='{sample['scenario']}', "
+                          f"image_shape={sample['image'].shape}, "
+                          f"structures_present={sample['presence_labels'].sum().item()}")
+
+            # Visualize samples (if not skipped)
+            if not args.skip_visualization:
+                print("\nVisualizing samples...")
+
+                # Find a normal case
+                normal_found = False
+                for i in range(min(20, len(lazy_dataset))):
+                    sample = lazy_dataset[i]
+                    if 'normal' in sample['scenario']:
+                        print(f"Visualizing normal case: {sample['scenario']}")
+                        visualize_sample(lazy_dataset, i)
+                        normal_found = True
+                        break
+
+                if not normal_found:
+                    print("No normal cases found in first 20 samples")
+
+                # Find an abnormal case
+                abnormal_found = False
+                for i in range(min(50, len(lazy_dataset))):
+                    sample = lazy_dataset[i]
+                    if any(keyword in sample['scenario'] for keyword in ['nephrectomy', 'resection', 'missing']):
+                        print(f"Visualizing abnormal case: {sample['scenario']}")
+                        visualize_sample(lazy_dataset, i)
+                        abnormal_found = True
+                        break
+
+                if not abnormal_found:
+                    print("No abnormal cases found in first 50 samples")
+
+            else:
+                print("Skipping visualization...")
+
+            # Test the training loop (if not skipped)
+            if not args.skip_training_test:
+                print("\nTesting training loop...")
+                example_training_loop()
+            else:
+                print("Skipping training loop test...")
+
+        except FileNotFoundError as e:
+            print(f"Could not test lazy loading: {e}")
+            print("Dataset directory not found. Run with dataset generation first!")
+        except Exception as e:
+            print(f"Error during testing: {e}")
+            if args.verbose:
+                import traceback
+                traceback.print_exc()
+
+    else:
+        print(f"Output directory {args.output_dir} does not exist. Cannot test lazy loading.")
+
+    print(f"\nScript completed successfully!")
+    print(f"Dataset available at: {args.output_dir}")
+
+
+if __name__ == "__main__":
+    main()
