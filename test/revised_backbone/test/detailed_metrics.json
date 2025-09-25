@@ -1,0 +1,370 @@
+{
+  "presence_overall_accuracy": 0.964965727341965,
+  "presence_per_structure": {
+    "left_lung": {
+      "accuracy": 0.9900990099009901,
+      "precision": 1.0,
+      "recall": 0.9873417721518988,
+      "f1_score": 0.9936305732484078,
+      "true_positives": 78,
+      "true_negatives": 22,
+      "false_positives": 0,
+      "false_negatives": 1,
+      "support_positive": 79,
+      "support_negative": 22,
+      "auc_roc": 1.0,
+      "auc_pr": 1.0
+    },
+    "right_lung": {
+      "accuracy": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1_score": 1.0,
+      "true_positives": 86,
+      "true_negatives": 15,
+      "false_positives": 0,
+      "false_negatives": 0,
+      "support_positive": 86,
+      "support_negative": 15,
+      "auc_roc": 1.0,
+      "auc_pr": 1.0
+    },
+    "heart": {
+      "accuracy": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1_score": 1.0,
+      "true_positives": 92,
+      "true_negatives": 9,
+      "false_positives": 0,
+      "false_negatives": 0,
+      "support_positive": 92,
+      "support_negative": 9,
+      "auc_roc": 1.0,
+      "auc_pr": 1.0
+    },
+    "liver": {
+      "accuracy": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1_score": 1.0,
+      "true_positives": 92,
+      "true_negatives": 9,
+      "false_positives": 0,
+      "false_negatives": 0,
+      "support_positive": 92,
+      "support_negative": 9,
+      "auc_roc": 1.0,
+      "auc_pr": 1.0
+    },
+    "spleen": {
+      "accuracy": 0.9306930693069307,
+      "precision": 0.9135802469135802,
+      "recall": 1.0,
+      "f1_score": 0.9548387096774192,
+      "true_positives": 74,
+      "true_negatives": 20,
+      "false_positives": 7,
+      "false_negatives": 0,
+      "support_positive": 74,
+      "support_negative": 27,
+      "auc_roc": 0.9809809809809809,
+      "auc_pr": 0.9931877831873892
+    },
+    "pancreas": {
+      "accuracy": 0.9801980198019802,
+      "precision": 0.9761904761904762,
+      "recall": 1.0,
+      "f1_score": 0.9879518072289156,
+      "true_positives": 82,
+      "true_negatives": 17,
+      "false_positives": 2,
+      "false_negatives": 0,
+      "support_positive": 82,
+      "support_negative": 19,
+      "auc_roc": 0.9961489088575097,
+      "auc_pr": 0.9990906373853261
+    },
+    "left_kidney": {
+      "accuracy": 0.9207920792079208,
+      "precision": 0.9113924050632911,
+      "recall": 0.9863013698630136,
+      "f1_score": 0.9473684210526315,
+      "true_positives": 72,
+      "true_negatives": 21,
+      "false_positives": 7,
+      "false_negatives": 1,
+      "support_positive": 73,
+      "support_negative": 28,
+      "auc_roc": 0.952054794520548,
+      "auc_pr": 0.9797135042074141
+    },
+    "right_kidney": {
+      "accuracy": 0.8712871287128713,
+      "precision": 0.9240506329113924,
+      "recall": 0.9125,
+      "f1_score": 0.9182389937106918,
+      "true_positives": 73,
+      "true_negatives": 15,
+      "false_positives": 6,
+      "false_negatives": 7,
+      "support_positive": 80,
+      "support_negative": 21,
+      "auc_roc": 0.9410714285714286,
+      "auc_pr": 0.9839808715436557
+    },
+    "L1": {
+      "accuracy": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1_score": 1.0,
+      "true_positives": 80,
+      "true_negatives": 21,
+      "false_positives": 0,
+      "false_negatives": 0,
+      "support_positive": 80,
+      "support_negative": 21,
+      "auc_roc": 1.0,
+      "auc_pr": 0.9999999999999999
+    },
+    "L2": {
+      "accuracy": 0.9702970297029703,
+      "precision": 0.9625,
+      "recall": 1.0,
+      "f1_score": 0.980891719745223,
+      "true_positives": 77,
+      "true_negatives": 21,
+      "false_positives": 3,
+      "false_negatives": 0,
+      "support_positive": 77,
+      "support_negative": 24,
+      "auc_roc": 0.9545454545454546,
+      "auc_pr": 0.9829811220055732
+    },
+    "L3": {
+      "accuracy": 0.9702970297029703,
+      "precision": 0.963855421686747,
+      "recall": 1.0,
+      "f1_score": 0.9815950920245399,
+      "true_positives": 80,
+      "true_negatives": 18,
+      "false_positives": 3,
+      "false_negatives": 0,
+      "support_positive": 80,
+      "support_negative": 21,
+      "auc_roc": 0.9416666666666668,
+      "auc_pr": 0.9809021013914224
+    },
+    "L4": {
+      "accuracy": 0.9108910891089109,
+      "precision": 0.9594594594594594,
+      "recall": 0.922077922077922,
+      "f1_score": 0.9403973509933775,
+      "true_positives": 71,
+      "true_negatives": 21,
+      "false_positives": 3,
+      "false_negatives": 6,
+      "support_positive": 77,
+      "support_negative": 24,
+      "auc_roc": 0.9464285714285714,
+      "auc_pr": 0.9773224894686576
+    },
+    "L5": {
+      "accuracy": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1_score": 1.0,
+      "true_positives": 80,
+      "true_negatives": 21,
+      "false_positives": 0,
+      "false_negatives": 0,
+      "support_positive": 80,
+      "support_negative": 21,
+      "auc_roc": 1.0,
+      "auc_pr": 1.0
+    }
+  },
+  "segmentation_per_structure": {
+    "left_lung": {
+      "mean_dice": 0.9717537654120356,
+      "std_dice": 0.048661264587534725,
+      "mean_iou": 0.9483051212995597,
+      "std_iou": 0.06887295894419622,
+      "num_samples": 79
+    },
+    "right_lung": {
+      "mean_dice": 0.9790930623784726,
+      "std_dice": 0.010987561460487402,
+      "mean_iou": 0.9592630856933515,
+      "std_iou": 0.020505531770079913,
+      "num_samples": 86
+    },
+    "heart": {
+      "mean_dice": 0.9515803440614915,
+      "std_dice": 0.059737523200940154,
+      "mean_iou": 0.9126016201118353,
+      "std_iou": 0.08757415852105267,
+      "num_samples": 92
+    },
+    "liver": {
+      "mean_dice": 0.9802661406154429,
+      "std_dice": 0.010703618115485746,
+      "mean_iou": 0.9615032878174543,
+      "std_iou": 0.01974971413167791,
+      "num_samples": 92
+    },
+    "spleen": {
+      "mean_dice": 0.8796654493611843,
+      "std_dice": 0.16120300902545162,
+      "mean_iou": 0.8097055582236272,
+      "std_iou": 0.17343340174056115,
+      "num_samples": 74
+    },
+    "pancreas": {
+      "mean_dice": 0.7642595871413465,
+      "std_dice": 0.1857780884604142,
+      "mean_iou": 0.6454181147947744,
+      "std_iou": 0.18303346910603668,
+      "num_samples": 82
+    },
+    "left_kidney": {
+      "mean_dice": 0.8711045408138876,
+      "std_dice": 0.13991380193327538,
+      "mean_iou": 0.7915853553109434,
+      "std_iou": 0.16435919333434806,
+      "num_samples": 73
+    },
+    "right_kidney": {
+      "mean_dice": 0.8421130269200485,
+      "std_dice": 0.17085965491050983,
+      "mean_iou": 0.7539342745106355,
+      "std_iou": 0.1850344471263713,
+      "num_samples": 80
+    },
+    "L1": {
+      "mean_dice": 0.7983528598296762,
+      "std_dice": 0.3221038162419669,
+      "mean_iou": 0.7504450514639014,
+      "std_iou": 0.32480565917897325,
+      "num_samples": 80
+    },
+    "L2": {
+      "mean_dice": 0.6041791818523398,
+      "std_dice": 0.35331166680734283,
+      "mean_iou": 0.5197058511664672,
+      "std_iou": 0.347877071245162,
+      "num_samples": 77
+    },
+    "L3": {
+      "mean_dice": 0.6903770559620348,
+      "std_dice": 0.30125256671416406,
+      "mean_iou": 0.5962481947520702,
+      "std_iou": 0.30659660829443824,
+      "num_samples": 80
+    },
+    "L4": {
+      "mean_dice": 0.7215865375372535,
+      "std_dice": 0.29819787740492926,
+      "mean_iou": 0.6359342858523019,
+      "std_iou": 0.3115912305777028,
+      "num_samples": 77
+    },
+    "L5": {
+      "mean_dice": 0.8607253371958852,
+      "std_dice": 0.23251963938335873,
+      "mean_iou": 0.8063547434107541,
+      "std_iou": 0.2531951417014087,
+      "num_samples": 80
+    }
+  },
+  "segmentation_overall": {
+    "mean_dice": 0.8396197606985462,
+    "mean_iou": 0.7762311188005906
+  },
+  "scenario_based": {
+    "normal_complete": {
+      "accuracy": 0.5882352941176471,
+      "num_samples": 34,
+      "avg_structures_present": 13.0,
+      "avg_structures_predicted": 12.588235294117647
+    },
+    "left_nephrectomy": {
+      "accuracy": 0.375,
+      "num_samples": 8,
+      "avg_structures_present": 12.0,
+      "avg_structures_predicted": 12.625
+    },
+    "normal_abdominal": {
+      "accuracy": 1.0,
+      "num_samples": 9,
+      "avg_structures_present": 5.0,
+      "avg_structures_predicted": 5.0
+    },
+    "right_nephrectomy": {
+      "accuracy": 0.375,
+      "num_samples": 8,
+      "avg_structures_present": 12.0,
+      "avg_structures_predicted": 12.625
+    },
+    "missing_L4": {
+      "accuracy": 0.0,
+      "num_samples": 3,
+      "avg_structures_present": 12.0,
+      "avg_structures_predicted": 13.0
+    },
+    "bilateral_lung_resection": {
+      "accuracy": 1.0,
+      "num_samples": 3,
+      "avg_structures_present": 11.0,
+      "avg_structures_predicted": 11.0
+    },
+    "normal_thoracic": {
+      "accuracy": 1.0,
+      "num_samples": 9,
+      "avg_structures_present": 3.0,
+      "avg_structures_predicted": 3.0
+    },
+    "extensive_resection": {
+      "accuracy": 1.0,
+      "num_samples": 2,
+      "avg_structures_present": 9.0,
+      "avg_structures_predicted": 9.0
+    },
+    "complex_abdominal_surgery": {
+      "accuracy": 0.6,
+      "num_samples": 5,
+      "avg_structures_present": 10.0,
+      "avg_structures_predicted": 11.0
+    },
+    "splenectomy": {
+      "accuracy": 0.375,
+      "num_samples": 8,
+      "avg_structures_present": 12.0,
+      "avg_structures_predicted": 12.5
+    },
+    "left_lung_resection": {
+      "accuracy": 1.0,
+      "num_samples": 5,
+      "avg_structures_present": 12.0,
+      "avg_structures_predicted": 12.0
+    },
+    "minimal_structures": {
+      "accuracy": 1.0,
+      "num_samples": 3,
+      "avg_structures_present": 3.0,
+      "avg_structures_predicted": 3.0
+    },
+    "missing_L2_L3": {
+      "accuracy": 0.0,
+      "num_samples": 3,
+      "avg_structures_present": 11.0,
+      "avg_structures_predicted": 13.0
+    },
+    "bilateral_nephrectomy": {
+      "accuracy": 0.0,
+      "num_samples": 1,
+      "avg_structures_present": 11.0,
+      "avg_structures_predicted": 13.0
+    }
+  }
+}
