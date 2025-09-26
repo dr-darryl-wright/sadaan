@@ -74,7 +74,11 @@ Worst performing structures (Dice score):
 
 ### Test set example visualisation
 ![](/test/revised_backbone/test/comprehensive_analysis_sample_1.png)
+---
 ![](/test/revised_backbone/test/comprehensive_analysis_sample_2.png)
+---
 ![](/test/revised_backbone/test/comprehensive_analysis_sample_3.png)
+---
 ![](/test/revised_backbone/test/comprehensive_analysis_sample_4.png)
+---
 ![](/test/revised_backbone/test/comprehensive_analysis_sample_5.png)
