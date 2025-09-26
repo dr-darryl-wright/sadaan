@@ -71,8 +71,7 @@ class MedicalSegmentationAnalyzer:
             })
 
         df_overall = pd.DataFrame(overall_acc)
-        bars = ax2.bar(df_overall['Dataset'], df_overall['Overall_Accuracy'],
-                       color=['#1f77b4', '#ff7f0e', '#2ca02c'])
+        bars = ax2.bar(df_overall['Dataset'], df_overall['Overall_Accuracy'])
         ax2.set_title('Overall Presence Detection Accuracy', fontsize=14, fontweight='bold')
         ax2.set_ylabel('Accuracy', fontsize=12)
         ax2.set_ylim([0, 1.0])
