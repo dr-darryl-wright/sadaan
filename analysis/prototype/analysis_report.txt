@@ -1,0 +1,39 @@
+======================================================================
+MEDICAL SEGMENTATION MODEL EVALUATION SUMMARY
+======================================================================
+
+1. OVERALL PERFORMANCE:
+-------------------------
+     TRAIN: Presence Acc: 0.9532, Dice: 0.1630, IoU: 0.1360
+VALIDATION: Presence Acc: 0.9477, Dice: 0.1608, IoU: 0.1334
+      TEST: Presence Acc: 0.9497, Dice: 0.1607, IoU: 0.1341
+
+2. STRUCTURE PERFORMANCE (Test Set):
+-----------------------------------
+Best performing structures (Dice score):
+            liver: 0.8138
+        left_lung: 0.6662
+       right_lung: 0.6086
+
+Worst performing structures (Dice score):
+      left_kidney: 0.0000
+     right_kidney: 0.0000
+            heart: 0.0000
+
+3. CHALLENGING SCENARIOS (Test Set):
+-----------------------------------
+Most challenging scenarios:
+         minimal_structures: 0.000 (n=3)
+                 missing_L4: 0.000 (n=3)
+      bilateral_nephrectomy: 0.000 (n=1)
+          right_nephrectomy: 0.000 (n=8)
+              missing_L2_L3: 0.000 (n=3)
+
+4. RECOMMENDATIONS:
+--------------------
+• Consider improving consistency for high-variance structures:
+  - liver (std: 0.247)
+  - left_lung (std: 0.230)
+  - right_lung (std: 0.185)
+• Good generalization (Train-Test Dice gap: 0.0023)
+======================================================================
