@@ -39,10 +39,10 @@ $ python analysis.py --train ../test/revised_backbone/train/detailed_metrics.jso
 **1. OVERALL PERFORMANCE:**
 
 
-**loss**
+loss
 ![](/src/loss.png)
 
-**metrics**
+metrics
 ![](/src/metrics.png)
 
 
