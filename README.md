@@ -22,11 +22,6 @@ $ python synthetic_medical_generator.py \
 ```bash
 $ python train.py with dataset_path="../data/synthetic_medical_dataset_hdf5/" training.batch_size="4"
 ```
-**loss**
-![](/src/loss.png)
-
-**metrics**
-![](/src/metrics.png)
 
 ### testing
 ```bash
@@ -42,6 +37,14 @@ $ python analysis.py --train ../test/revised_backbone/train/detailed_metrics.jso
 ## Analysis
 
 **1. OVERALL PERFORMANCE:**
+
+
+**loss**
+![](/src/loss.png)
+
+**metrics**
+![](/src/metrics.png)
+
 
 TRAIN: Presence Acc: 0.9994, Dice: 0.9338, IoU: 0.8862
 
