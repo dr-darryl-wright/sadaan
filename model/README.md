@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Spatial Attention Medical Segmentation Model is a PyTorch-based deep learning architecture designed for multi-organ segmentation in medical imaging with built-in absence detection capabilities. The model combines U-Net-style feature extraction with anatomical attention mechanisms and presence/absence detection to handle cases where anatomical structures may be missing from scans.
+The Spatial Attention for Detection of Absent Anatomy Model is a PyTorch-based deep learning architecture designed for multi-organ segmentation in medical imaging with built-in absence detection capabilities. The model combines U-Net-style feature extraction with anatomical attention mechanisms and presence/absence detection to handle cases where anatomical structures may be missing from scans.
 
 ## Architecture Components
 
